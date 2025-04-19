@@ -753,30 +753,23 @@ func calcOutputSingle(filter *sincFilter, increment, startFilterIndex incrementT
 // sincMonoVariProcess handles mono data with potentially varying sample rate ratio.
 // Corresponds to sinc_mono_vari_process in src_sinc.c (Corrected version)
 func sincMonoVariProcess(state *srcState, data *SrcData) ErrorCode {
-	// --- Get Filter State ---
 	filter, ok := state.privateData.(*sincFilter)
 	if !ok || filter == nil {
 		return ErrBadState
 	}
-
-	// --- Local variables ---
+	if state.channels != 1 {
+		return ErrBadInternalState
+	}
 	inputIndex := state.lastPosition
 	srcRatio := state.lastRatio
-
 	var increment, startFilterIndex incrementT
 	var halfFilterChanLen, samplesInHand int
-
-	// Use data fields directly for counts. Convert frames to samples.
-	// inCountSamples variable removed as it was unused.
 	outCountSamples := data.OutputFrames * int64(state.channels)
-
-	// Reset generated/used counts for this run
 	data.InputFramesUsed = 0
 	data.OutputFramesGen = 0
 	var inUsedSamples int64 = 0
 	var outGenSamples int64 = 0
 
-	// --- Basic Validation ---
 	if isBadSrcRatio(srcRatio) {
 		if isBadSrcRatio(data.SrcRatio) {
 			return ErrBadSrcRatio
@@ -784,8 +777,6 @@ func sincMonoVariProcess(state *srcState, data *SrcData) ErrorCode {
 		srcRatio = data.SrcRatio
 		state.lastRatio = srcRatio
 	}
-
-	// --- Calculate Required Lookback/Lookahead ---
 	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
 	if filter.indexInc <= 0 {
 		return ErrBadInternalState
@@ -798,10 +789,7 @@ func sincMonoVariProcess(state *srcState, data *SrcData) ErrorCode {
 	if minRatio < 1.0 && minRatio != 0 {
 		count /= minRatio
 	}
-	// halfFilterChanLen is samples needed on one side (past OR future)
 	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
-
-	// --- Adjust Buffer Position Based on Last Position ---
 	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
 	if filter.bLen <= 0 {
 		return ErrBadInternalState
@@ -809,62 +797,38 @@ func sincMonoVariProcess(state *srcState, data *SrcData) ErrorCode {
 	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 	inputIndex = fmodOne(inputIndex)
 
-	// --- Main Processing Loop ---
 	for outGenSamples < outCountSamples {
-
-		// --- Check if Buffer Reload is Needed ---
 		if filter.bEnd >= filter.bCurrent {
 			samplesInHand = filter.bEnd - filter.bCurrent
 		} else {
 			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 		}
-
-		if samplesInHand <= halfFilterChanLen { // Need enough samples *ahead*
-			// Update SrcData before calling prepareData
+		if samplesInHand <= halfFilterChanLen {
 			data.InputFramesUsed = inUsedSamples / int64(state.channels)
 			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
 			if errCode != ErrNoError {
 				state.errCode = errCode
 				return errCode
 			}
-			// Update local count based on what prepareData consumed
 			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-
-			// Recalculate samplesInHand
 			if filter.bEnd >= filter.bCurrent {
 				samplesInHand = filter.bEnd - filter.bCurrent
 			} else {
 				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 			}
-
 			if samplesInHand <= halfFilterChanLen {
-				break // Still not enough data (EOF reached)
-			}
-		}
-
-		// --- Check End Of Input Termination Condition --- (Corrected)
-		if filter.bRealEnd >= 0 { // If EOF marker is set
-			// Check if the highest index needed by the filter kernel
-			// exceeds the known end of data (bRealEnd).
-			// The kernel extends roughly halfFilterChanLen samples *beyond* bCurrent.
-			// Note: inputIndex refinement might be needed for perfect accuracy, but this is simpler.
-			maxIndexNeeded := filter.bCurrent + halfFilterChanLen // Highest sample index potentially accessed
-			if maxIndexNeeded >= filter.bRealEnd {
-				// Stop processing if the filter might read past the known end of data.
 				break
 			}
-			/* // Original attempt based on C code (less clear)
-			   terminate := 1.0 / srcRatio + 1e-20
-			   if float64(filter.bCurrent) + inputIndex*float64(state.channels) + terminate*float64(state.channels) > float64(filter.bRealEnd) {
-			        break
-			   }
-			*/
 		}
-
-		// --- Update Ratio (Linear Interpolation) ---
+		if filter.bRealEnd >= 0 {
+			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
+			if maxIndexNeeded >= filter.bRealEnd {
+				break
+			}
+		}
 		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
 			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) { // Clamp interpolated ratio
+			if isBadSrcRatio(srcRatio) {
 				if srcRatio < 1.0/srcMaxRatio {
 					srcRatio = 1.0 / srcMaxRatio
 				}
@@ -873,45 +837,31 @@ func sincMonoVariProcess(state *srcState, data *SrcData) ErrorCode {
 				}
 			}
 		}
-
-		// --- Calculate Filter Parameters for This Sample ---
 		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
 		increment = doubleToFP(floatIncrement)
 		if increment == 0 {
 			return ErrBadSrcRatio
 		}
 		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
-
-		// --- Calculate Output Sample ---
 		scaleFactor := floatIncrement / float64(filter.indexInc)
 		outputSample := scaleFactor * calcOutputSingle(filter, increment, startFilterIndex)
-
 		if int(outGenSamples) >= len(data.DataOut) {
 			return ErrBadData
-		} // Bounds check output buffer
+		}
 		data.DataOut[outGenSamples] = float32(outputSample)
 		outGenSamples++
-
-		// --- Update Input Index for Next Sample ---
 		if srcRatio == 0 {
 			return ErrBadSrcRatio
 		}
 		inputIndex += 1.0 / srcRatio
-
 		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
 		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 		inputIndex = fmodOne(inputIndex)
-
-	} // End main processing loop
-
-	// --- Save State for Next Call ---
+	}
 	state.lastPosition = inputIndex
 	state.lastRatio = srcRatio
-
-	// --- Update Output Counts ---
 	data.OutputFramesGen = outGenSamples / int64(state.channels)
-	data.InputFramesUsed = inUsedSamples / int64(state.channels) // Ensure final used count is set
-
+	data.InputFramesUsed = inUsedSamples / int64(state.channels)
 	return ErrNoError
 }
 
@@ -1034,34 +984,22 @@ func calcOutputStereo(filter *sincFilter, channels int, increment, startFilterIn
 // sincStereoVariProcess handles stereo data with potentially varying sample rate ratio.
 // Corresponds to sinc_stereo_vari_process in src_sinc.c
 func sincStereoVariProcess(state *srcState, data *SrcData) ErrorCode {
-	// --- Get Filter State ---
 	filter, ok := state.privateData.(*sincFilter)
 	if !ok || filter == nil {
 		return ErrBadState
 	}
-
-	// Ensure channel count matches
 	if state.channels != 2 {
 		return ErrBadInternalState
-	} // Should only be called for stereo
-
-	// --- Local variables ---
+	}
 	inputIndex := state.lastPosition
 	srcRatio := state.lastRatio
-
 	var increment, startFilterIndex incrementT
 	var halfFilterChanLen, samplesInHand int
-
-	// Use data fields directly for counts. Convert frames to samples.
 	outCountSamples := data.OutputFrames * int64(state.channels)
-
-	// Reset generated/used counts for this run
 	data.InputFramesUsed = 0
 	data.OutputFramesGen = 0
 	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0 // Track generated samples (L/R pairs count as 2)
-
-	// --- Basic Validation ---
+	var outGenSamples int64 = 0
 	if isBadSrcRatio(srcRatio) {
 		if isBadSrcRatio(data.SrcRatio) {
 			return ErrBadSrcRatio
@@ -1069,8 +1007,6 @@ func sincStereoVariProcess(state *srcState, data *SrcData) ErrorCode {
 		srcRatio = data.SrcRatio
 		state.lastRatio = srcRatio
 	}
-
-	// --- Calculate Required Lookback/Lookahead ---
 	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
 	if filter.indexInc <= 0 {
 		return ErrBadInternalState
@@ -1083,28 +1019,19 @@ func sincStereoVariProcess(state *srcState, data *SrcData) ErrorCode {
 	if minRatio < 1.0 && minRatio != 0 {
 		count /= minRatio
 	}
-	// halfFilterChanLen is total samples needed on one side (past OR future) across all channels
 	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
-
-	// --- Adjust Buffer Position Based on Last Position ---
 	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
 	if filter.bLen <= 0 {
 		return ErrBadInternalState
 	}
 	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 	inputIndex = fmodOne(inputIndex)
-
-	// --- Main Processing Loop ---
 	for outGenSamples < outCountSamples {
-
-		// --- Check if Buffer Reload is Needed ---
 		if filter.bEnd >= filter.bCurrent {
 			samplesInHand = filter.bEnd - filter.bCurrent
 		} else {
 			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 		}
-
-		// Need enough samples ahead for the filter kernel's right side
 		if samplesInHand <= halfFilterChanLen {
 			data.InputFramesUsed = inUsedSamples / int64(state.channels)
 			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
@@ -1113,31 +1040,24 @@ func sincStereoVariProcess(state *srcState, data *SrcData) ErrorCode {
 				return errCode
 			}
 			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-
 			if filter.bEnd >= filter.bCurrent {
 				samplesInHand = filter.bEnd - filter.bCurrent
 			} else {
 				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 			}
-
 			if samplesInHand <= halfFilterChanLen {
-				break // Still not enough data (EOF reached)
+				break
 			}
 		}
-
-		// --- Check End Of Input Termination Condition ---
 		if filter.bRealEnd >= 0 {
 			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
 			if maxIndexNeeded >= filter.bRealEnd {
-				break // Stop if filter might read past known end
+				break
 			}
 		}
-
-		// --- Update Ratio (Linear Interpolation) ---
 		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
-			// Note: C interpolates based on filter->out_gen, which is samples.
 			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) { // Clamp interpolated ratio
+			if isBadSrcRatio(srcRatio) {
 				if srcRatio < 1.0/srcMaxRatio {
 					srcRatio = 1.0 / srcMaxRatio
 				}
@@ -1146,54 +1066,32 @@ func sincStereoVariProcess(state *srcState, data *SrcData) ErrorCode {
 				}
 			}
 		}
-
-		// --- Calculate Filter Parameters for This Sample ---
 		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
 		increment = doubleToFP(floatIncrement)
 		if increment == 0 {
 			return ErrBadSrcRatio
 		}
 		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
-		scaleFactor := floatIncrement / float64(filter.indexInc) // = min(srcRatio, 1.0)
-
-		// --- Calculate Output Stereo Sample Pair ---
-		// Ensure output slice has space for 2 samples
-		outPos := int(outGenSamples) // Current position in samples
+		scaleFactor := floatIncrement / float64(filter.indexInc)
+		outPos := int(outGenSamples)
 		if outPos+state.channels > len(data.DataOut) {
-			// Not enough space for the next stereo pair, break loop
-			// This might happen if output buffer is slightly too small
-			// log.Printf("Warning: breaking stereo loop, not enough output space (%d+%d > %d)", outPos, state.channels, len(data.DataOut))
 			break
 		}
-		outputSlice := data.DataOut[outPos : outPos+state.channels] // Slice for the L/R pair
-
-		// Call the stereo calculation function
+		outputSlice := data.DataOut[outPos : outPos+state.channels]
 		calcOutputStereo(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
-
-		outGenSamples += int64(state.channels) // Increment generated sample count by 2
-
-		// --- Update Input Index for Next Sample ---
+		outGenSamples += int64(state.channels)
 		if srcRatio == 0 {
 			return ErrBadSrcRatio
 		}
 		inputIndex += 1.0 / srcRatio
-
 		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
 		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 		inputIndex = fmodOne(inputIndex)
-
-	} // End main processing loop
-
-	// --- Save State for Next Call ---
+	}
 	state.lastPosition = inputIndex
 	state.lastRatio = srcRatio
-
-	// --- Update Output Counts ---
-	// OutputFramesGen is frames, calculated from generated samples
 	data.OutputFramesGen = outGenSamples / int64(state.channels)
-	// InputFramesUsed reflects total consumed samples converted back to frames
 	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-
 	return ErrNoError
 }
 
@@ -1316,31 +1214,22 @@ func calcOutputQuad(filter *sincFilter, channels int, increment, startFilterInde
 // sincQuadVariProcess handles quad audio data with potentially varying sample rate ratio.
 // Corresponds to sinc_quad_vari_process in src_sinc.c
 func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
-	// --- Get Filter State ---
 	filter, ok := state.privateData.(*sincFilter)
 	if !ok || filter == nil {
 		return ErrBadState
 	}
-
-	// Ensure channel count matches
 	if state.channels != 4 {
 		return ErrBadInternalState
 	}
-
-	// --- Local variables ---
 	inputIndex := state.lastPosition
 	srcRatio := state.lastRatio
-
 	var increment, startFilterIndex incrementT
 	var halfFilterChanLen, samplesInHand int
-
 	outCountSamples := data.OutputFrames * int64(state.channels)
 	data.InputFramesUsed = 0
 	data.OutputFramesGen = 0
 	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0 // Track generated samples (groups of 4)
-
-	// --- Basic Validation ---
+	var outGenSamples int64 = 0
 	if isBadSrcRatio(srcRatio) {
 		if isBadSrcRatio(data.SrcRatio) {
 			return ErrBadSrcRatio
@@ -1348,8 +1237,6 @@ func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
 		srcRatio = data.SrcRatio
 		state.lastRatio = srcRatio
 	}
-
-	// --- Calculate Required Lookback/Lookahead ---
 	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
 	if filter.indexInc <= 0 {
 		return ErrBadInternalState
@@ -1362,26 +1249,19 @@ func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
 	if minRatio < 1.0 && minRatio != 0 {
 		count /= minRatio
 	}
-	halfFilterChanLen = state.channels * (psfLrint(count) + 1) // channels is 4
-
-	// --- Adjust Buffer Position Based on Last Position ---
+	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
 	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
 	if filter.bLen <= 0 {
 		return ErrBadInternalState
 	}
 	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 	inputIndex = fmodOne(inputIndex)
-
-	// --- Main Processing Loop ---
 	for outGenSamples < outCountSamples {
-
-		// --- Check if Buffer Reload is Needed ---
 		if filter.bEnd >= filter.bCurrent {
 			samplesInHand = filter.bEnd - filter.bCurrent
 		} else {
 			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 		}
-
 		if samplesInHand <= halfFilterChanLen {
 			data.InputFramesUsed = inUsedSamples / int64(state.channels)
 			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
@@ -1390,7 +1270,6 @@ func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
 				return errCode
 			}
 			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-
 			if filter.bEnd >= filter.bCurrent {
 				samplesInHand = filter.bEnd - filter.bCurrent
 			} else {
@@ -1398,21 +1277,17 @@ func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
 			}
 			if samplesInHand <= halfFilterChanLen {
 				break
-			} // EOF
+			}
 		}
-
-		// --- Check End Of Input Termination Condition ---
 		if filter.bRealEnd >= 0 {
 			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
 			if maxIndexNeeded >= filter.bRealEnd {
 				break
 			}
 		}
-
-		// --- Update Ratio (Linear Interpolation) ---
 		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
 			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) { // Clamp
+			if isBadSrcRatio(srcRatio) {
 				if srcRatio < 1.0/srcMaxRatio {
 					srcRatio = 1.0 / srcMaxRatio
 				}
@@ -1421,8 +1296,6 @@ func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
 				}
 			}
 		}
-
-		// --- Calculate Filter Parameters for This Sample ---
 		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
 		increment = doubleToFP(floatIncrement)
 		if increment == 0 {
@@ -1430,18 +1303,13 @@ func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
 		}
 		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
 		scaleFactor := floatIncrement / float64(filter.indexInc)
-
-		// --- Calculate Output Quad Sample Group ---
 		outPos := int(outGenSamples)
 		if outPos+state.channels > len(data.DataOut) {
 			break
-		} // Check output space
-		outputSlice := data.DataOut[outPos : outPos+state.channels] // Slice for 4 samples
-
+		}
+		outputSlice := data.DataOut[outPos : outPos+state.channels]
 		calcOutputQuad(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
-		outGenSamples += int64(state.channels) // Increment by 4
-
-		// --- Update Input Index for Next Sample ---
+		outGenSamples += int64(state.channels)
 		if srcRatio == 0 {
 			return ErrBadSrcRatio
 		}
@@ -1449,17 +1317,11 @@ func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
 		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
 		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 		inputIndex = fmodOne(inputIndex)
-
-	} // End main processing loop
-
-	// --- Save State for Next Call ---
+	}
 	state.lastPosition = inputIndex
 	state.lastRatio = srcRatio
-
-	// --- Update Output Counts ---
 	data.OutputFramesGen = outGenSamples / int64(state.channels)
 	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-
 	return ErrNoError
 }
 
@@ -1586,31 +1448,22 @@ func calcOutputHex(filter *sincFilter, channels int, increment, startFilterIndex
 // sincHexVariProcess handles 6-channel audio data with potentially varying sample rate ratio.
 // Corresponds to sinc_hex_vari_process in src_sinc.c
 func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
-	// --- Get Filter State ---
 	filter, ok := state.privateData.(*sincFilter)
 	if !ok || filter == nil {
 		return ErrBadState
 	}
-
-	// Ensure channel count matches
 	if state.channels != 6 {
 		return ErrBadInternalState
 	}
-
-	// --- Local variables ---
 	inputIndex := state.lastPosition
 	srcRatio := state.lastRatio
-
 	var increment, startFilterIndex incrementT
 	var halfFilterChanLen, samplesInHand int
-
 	outCountSamples := data.OutputFrames * int64(state.channels)
 	data.InputFramesUsed = 0
 	data.OutputFramesGen = 0
 	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0 // Track generated samples (groups of 6)
-
-	// --- Basic Validation ---
+	var outGenSamples int64 = 0
 	if isBadSrcRatio(srcRatio) {
 		if isBadSrcRatio(data.SrcRatio) {
 			return ErrBadSrcRatio
@@ -1618,8 +1471,6 @@ func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
 		srcRatio = data.SrcRatio
 		state.lastRatio = srcRatio
 	}
-
-	// --- Calculate Required Lookback/Lookahead ---
 	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
 	if filter.indexInc <= 0 {
 		return ErrBadInternalState
@@ -1632,26 +1483,19 @@ func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
 	if minRatio < 1.0 && minRatio != 0 {
 		count /= minRatio
 	}
-	halfFilterChanLen = state.channels * (psfLrint(count) + 1) // channels = 6
-
-	// --- Adjust Buffer Position Based on Last Position ---
+	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
 	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
 	if filter.bLen <= 0 {
 		return ErrBadInternalState
 	}
 	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 	inputIndex = fmodOne(inputIndex)
-
-	// --- Main Processing Loop ---
 	for outGenSamples < outCountSamples {
-
-		// --- Check if Buffer Reload is Needed ---
 		if filter.bEnd >= filter.bCurrent {
 			samplesInHand = filter.bEnd - filter.bCurrent
 		} else {
 			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 		}
-
 		if samplesInHand <= halfFilterChanLen {
 			data.InputFramesUsed = inUsedSamples / int64(state.channels)
 			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
@@ -1660,7 +1504,6 @@ func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
 				return errCode
 			}
 			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-
 			if filter.bEnd >= filter.bCurrent {
 				samplesInHand = filter.bEnd - filter.bCurrent
 			} else {
@@ -1668,21 +1511,17 @@ func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
 			}
 			if samplesInHand <= halfFilterChanLen {
 				break
-			} // EOF
+			}
 		}
-
-		// --- Check End Of Input Termination Condition ---
 		if filter.bRealEnd >= 0 {
 			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
 			if maxIndexNeeded >= filter.bRealEnd {
 				break
 			}
 		}
-
-		// --- Update Ratio (Linear Interpolation) ---
 		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
 			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) { // Clamp
+			if isBadSrcRatio(srcRatio) {
 				if srcRatio < 1.0/srcMaxRatio {
 					srcRatio = 1.0 / srcMaxRatio
 				}
@@ -1691,8 +1530,6 @@ func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
 				}
 			}
 		}
-
-		// --- Calculate Filter Parameters for This Sample ---
 		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
 		increment = doubleToFP(floatIncrement)
 		if increment == 0 {
@@ -1700,18 +1537,13 @@ func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
 		}
 		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
 		scaleFactor := floatIncrement / float64(filter.indexInc)
-
-		// --- Calculate Output Hex Sample Group ---
 		outPos := int(outGenSamples)
 		if outPos+state.channels > len(data.DataOut) {
 			break
-		} // Check output space
-		outputSlice := data.DataOut[outPos : outPos+state.channels] // Slice for 6 samples
-
+		}
+		outputSlice := data.DataOut[outPos : outPos+state.channels]
 		calcOutputHex(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
-		outGenSamples += int64(state.channels) // Increment by 6
-
-		// --- Update Input Index for Next Sample ---
+		outGenSamples += int64(state.channels)
 		if srcRatio == 0 {
 			return ErrBadSrcRatio
 		}
@@ -1719,31 +1551,28 @@ func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
 		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
 		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 		inputIndex = fmodOne(inputIndex)
-
-	} // End main processing loop
-
-	// --- Save State for Next Call ---
+	}
 	state.lastPosition = inputIndex
 	state.lastRatio = srcRatio
-
-	// --- Update Output Counts ---
 	data.OutputFramesGen = outGenSamples / int64(state.channels)
 	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-
 	return ErrNoError
 }
 
 // calcOutputMulti calculates a set of interpolated output samples for multiple channels.
-// Corresponds to calc_output_multi in src_sinc.c
+// Corresponds to calc_output_multi in src_sinc.c (Now Implemented)
 func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterIndex incrementT, scale float64, output []float32) {
-	// Ensure output slice has space for 'channels' samples
 	if len(output) < channels {
 		panic(fmt.Sprintf("calcOutputMulti: output slice too small (len=%d, need %d)", len(output), channels))
 	}
+	// Ensure scratch arrays are large enough (should be maxChannels)
+	if channels > maxChannels {
+		panic(fmt.Sprintf("calcOutputMulti: channel count %d exceeds maxChannels %d", channels, maxChannels))
+	}
+
 	// Use the scratch arrays from the filter struct
-	// Important: These arrays must be zeroed before use here, or ensure they are always zeroed after use. C uses memset.
-	left := filter.leftCalc[:]   // Slice view of the array
-	right := filter.rightCalc[:] // Slice view of the array
+	left := filter.leftCalc[:channels]   // Slice to the number of channels needed
+	right := filter.rightCalc[:channels] // Slice to the number of channels needed
 
 	// Zero out scratch arrays before accumulating
 	for ch := 0; ch < channels; ch++ {
@@ -1761,7 +1590,6 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 
 	if dataIndex < 0 {
 		steps := intDivCeil(-dataIndex, channels)
-
 		if increment <= 0 {
 			panic("calcOutputMulti: increment must be positive")
 		}
@@ -1772,7 +1600,6 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 		if steps > maxSteps {
 			panic(fmt.Sprintf("calcOutputMulti: buffer underflow assertion failed (steps=%d > maxSteps=%d, filterIndex=%d, increment=%d)", steps, maxSteps, filterIndex, increment))
 		}
-
 		filterIndex -= incrementT(steps) * increment
 		dataIndex += steps * channels
 	}
@@ -1780,13 +1607,11 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 	for filterIndex >= 0 {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
-			panic(fmt.Sprintf("calcOutputMulti: left coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
+			panic(fmt.Sprintf("calcOutputMulti: left coeff index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (dataIndex to dataIndex + channels - 1)
 		endDataIdx := dataIndex + channels - 1
 		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputMulti: left buffer index out of allocated bounds (dataIndex=%d, channels=%d, bLen=%d)", dataIndex, channels, filter.bLen))
@@ -1795,11 +1620,9 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 			panic(fmt.Sprintf("calcOutputMulti: left buffer index out of valid data range (dataIndex=%d, channels=%d, bEnd=%d)", dataIndex, channels, filter.bEnd))
 		}
 
-		// Accumulate for all channels
 		for ch := 0; ch < channels; ch++ {
 			left[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
 		}
-
 		filterIndex -= increment
 		dataIndex += channels
 	}
@@ -1818,13 +1641,11 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 	for {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
-			panic(fmt.Sprintf("calcOutputMulti: right coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
+			panic(fmt.Sprintf("calcOutputMulti: right coeff index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (dataIndex to dataIndex + channels - 1)
 		endDataIdx := dataIndex + channels - 1
 		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputMulti: right buffer index out of allocated bounds (dataIndex=%d, channels=%d, bLen=%d)", dataIndex, channels, filter.bLen))
@@ -1833,18 +1654,15 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 			panic(fmt.Sprintf("calcOutputMulti: right buffer index out of valid data range (dataIndex=%d, channels=%d, bEnd=%d)", dataIndex, channels, filter.bEnd))
 		}
 
-		// Accumulate for all channels
 		for ch := 0; ch < channels; ch++ {
 			right[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
 		}
-
 		filterIndex -= increment
 		dataIndex -= channels
-
 		if !(filterIndex > 0) {
 			break
 		}
-	} // End do-while loop
+	}
 
 	// --- Combine, scale, and write output ---
 	for ch := 0; ch < channels; ch++ {
@@ -1855,28 +1673,20 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 // sincMultichanVariProcess handles generic multi-channel audio data.
 // Corresponds to sinc_multichan_vari_process in src_sinc.c
 func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
-	// --- Get Filter State ---
 	filter, ok := state.privateData.(*sincFilter)
 	if !ok || filter == nil {
 		return ErrBadState
 	}
-
-	// No specific channel check here, handles N channels > 6 (or if others aren't enabled)
-
-	// --- Local variables ---
+	// No specific channel check here
 	inputIndex := state.lastPosition
 	srcRatio := state.lastRatio
-
 	var increment, startFilterIndex incrementT
 	var halfFilterChanLen, samplesInHand int
-
 	outCountSamples := data.OutputFrames * int64(state.channels)
 	data.InputFramesUsed = 0
 	data.OutputFramesGen = 0
 	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0 // Track generated samples (groups of 'channels')
-
-	// --- Basic Validation ---
+	var outGenSamples int64 = 0
 	if isBadSrcRatio(srcRatio) {
 		if isBadSrcRatio(data.SrcRatio) {
 			return ErrBadSrcRatio
@@ -1884,8 +1694,6 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 		srcRatio = data.SrcRatio
 		state.lastRatio = srcRatio
 	}
-
-	// --- Calculate Required Lookback/Lookahead ---
 	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
 	if filter.indexInc <= 0 {
 		return ErrBadInternalState
@@ -1899,25 +1707,18 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 		count /= minRatio
 	}
 	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
-
-	// --- Adjust Buffer Position Based on Last Position ---
 	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
 	if filter.bLen <= 0 {
 		return ErrBadInternalState
 	}
 	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 	inputIndex = fmodOne(inputIndex)
-
-	// --- Main Processing Loop ---
 	for outGenSamples < outCountSamples {
-
-		// --- Check if Buffer Reload is Needed ---
 		if filter.bEnd >= filter.bCurrent {
 			samplesInHand = filter.bEnd - filter.bCurrent
 		} else {
 			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 		}
-
 		if samplesInHand <= halfFilterChanLen {
 			data.InputFramesUsed = inUsedSamples / int64(state.channels)
 			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
@@ -1926,7 +1727,6 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 				return errCode
 			}
 			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-
 			if filter.bEnd >= filter.bCurrent {
 				samplesInHand = filter.bEnd - filter.bCurrent
 			} else {
@@ -1934,21 +1734,17 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 			}
 			if samplesInHand <= halfFilterChanLen {
 				break
-			} // EOF
+			}
 		}
-
-		// --- Check End Of Input Termination Condition ---
 		if filter.bRealEnd >= 0 {
 			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
 			if maxIndexNeeded >= filter.bRealEnd {
 				break
 			}
 		}
-
-		// --- Update Ratio (Linear Interpolation) ---
 		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
 			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) { // Clamp
+			if isBadSrcRatio(srcRatio) {
 				if srcRatio < 1.0/srcMaxRatio {
 					srcRatio = 1.0 / srcMaxRatio
 				}
@@ -1957,8 +1753,6 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 				}
 			}
 		}
-
-		// --- Calculate Filter Parameters for This Sample ---
 		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
 		increment = doubleToFP(floatIncrement)
 		if increment == 0 {
@@ -1966,18 +1760,14 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 		}
 		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
 		scaleFactor := floatIncrement / float64(filter.indexInc)
-
-		// --- Calculate Output Multi Sample Group ---
 		outPos := int(outGenSamples)
 		if outPos+state.channels > len(data.DataOut) {
 			break
-		} // Check output space
-		outputSlice := data.DataOut[outPos : outPos+state.channels] // Slice for 'channels' samples
-
+		}
+		outputSlice := data.DataOut[outPos : outPos+state.channels]
+		// *** Call calcOutputMulti ***
 		calcOutputMulti(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
-		outGenSamples += int64(state.channels) // Increment by 'channels'
-
-		// --- Update Input Index for Next Sample ---
+		outGenSamples += int64(state.channels)
 		if srcRatio == 0 {
 			return ErrBadSrcRatio
 		}
@@ -1985,17 +1775,11 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
 		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
 		inputIndex = fmodOne(inputIndex)
-
-	} // End main processing loop
-
-	// --- Save State for Next Call ---
+	}
 	state.lastPosition = inputIndex
 	state.lastRatio = srcRatio
-
-	// --- Update Output Counts ---
 	data.OutputFramesGen = outGenSamples / int64(state.channels)
 	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-
 	return ErrNoError
 }
 

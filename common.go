@@ -139,7 +139,7 @@ const (
 
 // --- Internal Helper Functions (from common.h) ---
 
-// psfLrint rounds a float64 to the nearest integer (like C lrint).
+// // psfLrint rounds a float64 to the nearest integer (like C lrint).
 func psfLrint(x float64) int {
 	// Go's math.Round rounds half to even, C's lrint typically rounds half away from zero.
 	// Depending on requirements, math.Round might be sufficient, or a custom impl needed.
@@ -151,6 +151,16 @@ func psfLrint(x float64) int {
 func psfLrintf(x float32) int {
 	return int(math.Round(float64(x) + 0.0))
 }
+
+//// psfLrintf rounds a float32 to the nearest integer, rounding half away from zero.
+//// Mimics C lrintf behavior.
+//func psfLrintf(x float32) int {
+//	xf64 := float64(x) // Convert to float64 for calculation
+//	if xf64 >= 0.0 {
+//		return int(math.Floor(xf64 + 0.5))
+//	}
+//	return int(math.Ceil(xf64 - 0.5))
+//}
 
 // fmodOne calculates x mod 1.0, ensuring the result is in [0.0, 1.0).
 func fmodOne(x float64) float64 {

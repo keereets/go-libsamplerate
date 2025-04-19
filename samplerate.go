@@ -728,54 +728,54 @@ func FloatToShortArray(in []float32, out []int16) {
 }
 
 // IntToFloatArray converts a slice of int32 to float32.
+// (Revised for potentially better precision)
 func IntToFloatArray(in []int32, out []float32) {
 	count := minInt(len(in), len(out))
-	// Corresponds to C: 1.0 / (8.0 * 0x10000000) = 1.0 / 2^3 / 2^28 = 1.0 / 2^31
-	scale := float32(1.0 / 2147483648.0)
+	// Use float64 for the scaling factor calculation for better precision
+	scale64 := float64(1.0 / 2147483648.0) // 1.0 / 2^31
 	for i := 0; i < count; i++ {
-		out[i] = float32(in[i]) * scale
+		// Perform calculation in float64 and convert to float32 at the end
+		out[i] = float32(float64(in[i]) * scale64)
+		// Alternative: Direct division might be optimized well?
+		// out[i] = float32(float64(in[i]) / 2147483648.0)
 	}
 }
 
 // FloatToIntArray converts a slice of float32 to int32 with clipping.
+// (Ensure psfLrint is the updated version rounding half away from zero)
 func FloatToIntArray(in []float32, out []int32) {
 	count := minInt(len(in), len(out))
-	// Corresponds to C: 8.0 * 0x10000000 = 2^3 * 2^28 = 2^31
-	scale := float64(2147483648.0)
-	maxInt32 := float64(math.MaxInt32) // 2147483647.0
-	minInt32 := float64(math.MinInt32) // -2147483648.0
+	scale := float64(2147483648.0)          // 2^31
+	maxInt32Float := float64(math.MaxInt32) // 2147483647.0
+	minInt32Float := float64(math.MinInt32) // -2147483648.0
 
 	for i := 0; i < count; i++ {
 		scaledValue := float64(in[i]) * scale
-		// Round using psfLrint (rounds float64)
-		rounded := psfLrint(scaledValue) // Returns int
 
-		// Clip (use float64 comparison before converting to int32)
-		// Check against the limits as float64 before rounding might be more robust for edges
-		if scaledValue >= maxInt32 {
+		// Clip BEFORE rounding - this might be important if scaling pushes value
+		// slightly beyond representable range before rounding pulls it back.
+		// C might rely on float->int conversion behavior for this.
+		if scaledValue >= maxInt32Float+0.5 { // Check threshold slightly above max for rounding
 			out[i] = math.MaxInt32
-		} else if scaledValue <= minInt32 {
+			continue
+		}
+		// For negative, check threshold slightly below min
+		if scaledValue <= minInt32Float-0.5 {
 			out[i] = math.MinInt32
-		} else {
-			// Check rounded value just in case rounding pushes it over
-			if rounded >= math.MaxInt32 {
-				out[i] = math.MaxInt32
-			} else if rounded <= math.MinInt32 {
-				out[i] = math.MinInt32
-			} else {
-				out[i] = int32(rounded)
-			}
+			continue
 		}
 
-		/* // Original C clipping logic (might depend on CPU behavior)
-		#if CPU_CLIPS_POSITIVE == 0
-		        if scaledValue >= maxInt32 { out [i] = math.MaxInt32; continue; }
-		#endif
-		#if CPU_CLIPS_NEGATIVE == 0
-		        if scaledValue <= minInt32 { out [i] = math.MinInt32; continue; }
-		#endif
-		        out[i] = int32(psfLrint(scaledValue))
-		*/
+		// Now round using psfLrint (rounds half away from zero)
+		rounded := psfLrint(scaledValue) // Returns int
+
+		// Final check after rounding (paranoia, maybe not needed if above clips work)
+		if rounded >= math.MaxInt32 {
+			out[i] = math.MaxInt32
+		} else if rounded <= math.MinInt32 {
+			out[i] = math.MinInt32
+		} else {
+			out[i] = int32(rounded)
+		}
 	}
 }
 
