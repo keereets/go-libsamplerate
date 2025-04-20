@@ -376,37 +376,6 @@ func (state *srcState) Clone() (Converter, error) {
 	return newState, nil // Return the new state as the Converter interface
 }
 
-// --- Utility Functions ---
-
-// GetName returns the name of a converter type.
-//func GetName(converterType ConverterType) string {
-//	// Delegate to internal functions (which need to be translated)
-//	if name := sincGetName(converterType); name != "" {
-//		return name
-//	}
-//	if name := zohGetName(converterType); name != "" {
-//		return name
-//	}
-//	if name := linearGetName(converterType); name != "" {
-//		return name
-//	}
-//	return "" // Unknown type
-//}
-//
-//// GetDescription returns the description of a converter type.
-//func GetDescription(converterType ConverterType) string {
-//	if desc := sincGetDescription(converterType); desc != "" {
-//		return desc
-//	}
-//	if desc := zohGetDescription(converterType); desc != "" {
-//		return desc
-//	}
-//	if desc := linearGetDescription(converterType); desc != "" {
-//		return desc
-//	}
-//	return "" // Unknown type
-//}
-
 // Version returns the library version string.
 func Version() string {
 	// Match the C function, potentially update string over time
@@ -569,39 +538,6 @@ func mapGoErrorToCode(err error) ErrorCode {
 // --- Internal Dispatcher ---
 
 // psrcSetConverter selects and initializes the specific converter state.
-// Corresponds to static psrc_set_converter in samplerate.c
-//func psrcSetConverter(converterType ConverterType, channels int) (*srcState, ErrorCode) {
-//	var state *srcState
-//	var errCode ErrorCode
-//
-//	switch converterType {
-//	case SincBestQuality:
-//		if !enableSincBestConverter {
-//			return nil, ErrBadConverter
-//		}
-//		state, errCode = newSincState(converterType, channels) // Assumes this function exists
-//	case SincMediumQuality:
-//		if !enableSincMediumConverter {
-//			return nil, ErrBadConverter
-//		}
-//		state, errCode = newSincState(converterType, channels) // Assumes this function exists
-//	case SincFastest:
-//		if !enableSincFastConverter {
-//			return nil, ErrBadConverter
-//		}
-//		state, errCode = newSincState(converterType, channels) // Assumes this function exists
-//	case ZeroOrderHold:
-//		state, errCode = newZohState(channels) // Assumes this function exists
-//	case Linear:
-//		state, errCode = newLinearState(channels) // Assumes this function exists
-//	default:
-//		return nil, ErrBadConverter
-//	}
-//
-//	return state, errCode
-//}
-
-// psrcSetConverter selects and initializes the specific converter state.
 // Corresponds to static psrc_set_converter in samplerate.c (Updated)
 // psrcSetConverter selects and initializes the specific converter state.
 // Corresponds to static psrc_set_converter in samplerate.c (Updated)
@@ -665,36 +601,6 @@ func GetDescription(converterType ConverterType) string {
 	}
 	return "" // Unknown type
 }
-
-// --- Utility Functions ---
-
-//// GetName returns the name of a converter type. (Updated)
-//func GetName(converterType ConverterType) string {
-//	if name := sincGetName(converterType); name != "" {
-//		return name
-//	}
-//	if name := zohGetName(converterType); name != "" {
-//		return name
-//	}
-//	if name := linearGetNameInternal(converterType); name != "" {
-//		return name
-//	} // Use internal func
-//	return "" // Unknown type
-//}
-//
-//// GetDescription returns the description of a converter type. (Updated)
-//func GetDescription(converterType ConverterType) string {
-//	if desc := sincGetDescription(converterType); desc != "" {
-//		return desc
-//	}
-//	if desc := zohGetDescription(converterType); desc != "" {
-//		return desc
-//	}
-//	if desc := linearGetDescriptionInternal(converterType); desc != "" {
-//		return desc
-//	} // Use internal func
-//	return "" // Unknown type
-//}
 
 // --- Sample Format Conversion Helpers ---
 

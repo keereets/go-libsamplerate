@@ -1,9 +1,9 @@
-// sinc.go
 package libsamplerate
 
 import (
 	"fmt"
 	"math"
+	"os"
 )
 
 // --- Sinc Specific Types ---
@@ -47,6 +47,9 @@ const (
 	fpOne     = 1 << shiftBits // Fixed point representation of 1.0
 	invFpOne  = 1.0 / float64(fpOne)
 )
+
+// Check environment variable ONCE at package initialization
+var sincDebugEnabled = (os.Getenv("SINC_DEBUG") == "1")
 
 // incrementT is the fixed-point type used for filter calculations
 type incrementT = int32 // Match C typedef int32_t increment_t
@@ -225,10 +228,15 @@ func sincReset(state *srcState) {
 	}
 	filter, ok := state.privateData.(*sincFilter)
 	if !ok || filter == nil {
-		fmt.Printf("Error/Warning: sincReset: PrivateData is not a valid *sincFilter (type: %T)\n", state.privateData)
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincReset: ERROR: PrivateData is not a valid *sincFilter (type: %T)\n", state.privateData)
+		}
 		return
 	}
 
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincReset: Resetting filter state.\n") // LOGGING
+	}
 	// Reset buffer pointers and state
 	filter.bCurrent = 0
 	filter.bEnd = 0
@@ -274,6 +282,9 @@ func sincClose(state *srcState) {
 		// Already closed or invalid state?
 		return
 	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincClose: Closing filter state.\n") // LOGGING
+	}
 	// In pure Go with GC, we mainly just need to nil out references
 	// to help the GC and prevent accidental reuse via stale pointers.
 	// The buffer slice will be GC'd.
@@ -291,7 +302,13 @@ func sincCopy(state *srcState) *srcState {
 	if !ok || origFilter == nil {
 		// Invalid state to copy
 		state.errCode = ErrBadState // Mark original state as bad? C doesn't seem to.
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincCopy: ERROR: Original state has invalid private data.\n") // LOGGING
+		}
 		return nil
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincCopy: Copying filter state.\n") // LOGGING
 	}
 
 	// 1. Create new outer state and copy simple fields
@@ -374,146 +391,167 @@ var sincMultichanStateVT = srcStateVT{
 // prepareData manages the internal buffer, loading new data as needed.
 // Corresponds to prepare_data in src_sinc.c
 func prepareData(filter *sincFilter, channels int, data *SrcData, halfFilterChanLen int) ErrorCode {
+	// ***** LOGGING START *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] prepareData: ENTRY - bCurrent=%d, bEnd=%d, bLen=%d, bRealEnd=%d, halfFCLen=%d, data.InFrames=%d, data.InUsed=%d, data.EOF=%t\n",
+			filter.bCurrent, filter.bEnd, filter.bLen, filter.bRealEnd, halfFilterChanLen, data.InputFrames, data.InputFramesUsed, data.EndOfInput)
+	}
+	// ***** LOGGING END *****
+
 	// Ensure valid input indices from SrcData
 	// C uses filter->in_count, filter->in_used directly, but we rely on SrcData fields
 	inCount := data.InputFrames * int64(channels)
-	inUsed := data.InputFramesUsed * int64(channels)
+	initialInUsedSamples := data.InputFramesUsed * int64(channels) // Use local var to track consumption *within* this call
+	inUsedSamples := initialInUsedSamples
 
 	// C: if (filter->b_real_end >= 0) return SRC_ERR_NO_ERROR;
 	if filter.bRealEnd >= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: bRealEnd (%d) >= 0, returning early.\n", filter.bRealEnd) // LOGGING
+		}
 		return ErrNoError // Already marked end-of-input, don't load more.
 	}
 
 	// C: if (data->data_in == NULL) return SRC_ERR_NO_ERROR;
 	// In Go, check slice length. If InputFrames > 0, DataIn must be valid.
 	if data.InputFrames > 0 && len(data.DataIn) == 0 {
-		// This condition should have been caught by Process, but double-check
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: ERROR: data.InputFrames > 0 but len(data.DataIn) == 0\n") // LOGGING
+		}
 		return ErrBadDataPtr
 	}
-	// If no new input frames are provided, we also don't need to load.
-	if data.InputFrames == 0 {
-		// If it's also end_of_input, we might need padding later.
-		// But for loading, there's nothing to do now.
-		// However, the C code proceeds to calculate 'len' based on buffer state.
-		// Let's stick closer to C logic flow. If data_in is conceptually NULL,
-		// but input_frames is > 0, that's an error. If input_frames is 0,
-		// there's just no data *to* copy, but we might still wrap the buffer.
-		// The C check `data->data_in == NULL` seems to imply "no buffer provided".
-		// Let's refine: if no *more* frames available, return.
-		if inUsed >= inCount && !data.EndOfInput {
-			// No more frames available in this data block, and not EOF yet.
-			return ErrNoError // Nothing to load right now.
+	// If no new input frames are available *relative to what's already been used*, we also don't need to load.
+	if inUsedSamples >= inCount && !data.EndOfInput {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: No more frames in current block and not EOF, returning.\n") // LOGGING
 		}
-		// If inUsed >= inCount AND data.EndOfInput is true, we fall through to padding logic below.
+		return ErrNoError // Nothing to load right now.
+	}
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] prepareData: Passed initial checks.\n")
 	}
 
-	currentDataOffset := int(inUsed) // Start offset in data.DataIn slice
+	currentDataOffset := int(inUsedSamples) // Start offset in data.DataIn slice
 
 	var requiredLen int // How many samples we need to load
 
 	// Buffer management logic:
-	if filter.bCurrent == 0 {
+	if filter.bCurrent == 0 { // C checks b_current == 0 for initial fill
+		// ***** LOGGING *****
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Initial buffer fill case (bCurrent == 0).\n")
+		}
 		// Initial state or after wrap-around where bCurrent is reset to 0 implicitly by % op.
-		// However, C code uses b_current==0 specifically for *initial* state setup.
-		// This might need refinement if buffer wrap makes b_current exactly 0 later.
-		// Assuming C's intent: First time filling the buffer.
-
-		// C: len = filter->b_len - 2 * half_filter_chan_len ;
+		// C code uses b_current==0 specifically for *initial* state setup.
 		requiredLen = filter.bLen - (2 * halfFilterChanLen)
 		if requiredLen < 0 {
 			requiredLen = 0
 		} // Ensure non-negative
 
-		// C: filter->b_current = filter->b_end = half_filter_chan_len ;
-		// Set initial read/write pointers after the initial zero-padding area.
 		filter.bCurrent = halfFilterChanLen
 		filter.bEnd = halfFilterChanLen
 		// Buffer from 0 to halfFilterChanLen-1 is implicitly zero (from make or reset)
 
 	} else if filter.bEnd+halfFilterChanLen+channels < filter.bLen {
+		// ***** LOGGING *****
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Enough space at buffer end case.\n")
+		}
 		// Enough space at the end of the buffer to load new data directly.
-		// C: len = MAX (filter->b_len - filter->b_current - half_filter_chan_len, 0) ;
-		// This seems wrong in C? Should be based on b_end? Let's recalculate based on available space.
-		// Available space at end = filter.bLen - filter.bEnd
-		// Let's rethink requiredLen: how much *can* we load?
 		availableSpaceAtEnd := filter.bLen - filter.bEnd
 		requiredLen = availableSpaceAtEnd // Max we can load without wrapping
 
 	} else {
+		// ***** LOGGING *****
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Buffer wrap case. bEnd=%d, bCurrent=%d, halfFCLen=%d, bLen=%d\n", filter.bEnd, filter.bCurrent, halfFilterChanLen, filter.bLen)
+		}
 		// Need to wrap data from the end back to the beginning.
-		// C: len = filter->b_end - filter->b_current ; (length of valid data currently)
 		validDataLen := filter.bEnd - filter.bCurrent
 		if validDataLen < 0 {
-			// This implies b_end < b_current, which shouldn't happen with append-only logic?
-			// If it's a ring buffer where b_end wrapped but b_current hasn't, this calculation is wrong.
-			// Let's assume C uses simple append and wrap: b_end is always >= b_current before wrap.
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: ERROR: Buffer wrap case detected bEnd (%d) < bCurrent (%d)\n", filter.bEnd, filter.bCurrent) // LOGGING
+			}
 			return ErrBadInternalState // Should not happen
 		}
 
-		// C: memmove (filter->buffer, filter->buffer + filter->b_current - half_filter_chan_len,
-		//             (half_filter_chan_len + len) * sizeof (filter->buffer [0])) ;
-		// Go: copy(dest, src)
 		srcStart := filter.bCurrent - halfFilterChanLen // Start of data to preserve (incl lookback)
 		copyLen := halfFilterChanLen + validDataLen
 
 		// Bounds checks for source slice
 		if srcStart < 0 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: ERROR: Buffer wrap srcStart (%d) < 0\n", srcStart) // LOGGING
+			}
 			return ErrBadInternalState
-		} // Should have enough lookback space
+		}
 		if srcStart+copyLen > len(filter.buffer) {
-			fmt.Printf("prepareData wrap src bounds error: srcStart=%d, copyLen=%d, bufLen=%d\n", srcStart, copyLen, len(filter.buffer))
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: ERROR: Buffer wrap src bounds error: srcStart=%d, copyLen=%d, bufLen=%d\n", srcStart, copyLen, len(filter.buffer)) // LOGGING
+			}
 			return ErrBadInternalState // Trying to copy past end of allocated buffer
 		}
 
 		// Check destination bounds (copying to start of buffer)
 		if copyLen > len(filter.buffer) {
-			fmt.Printf("prepareData wrap dest bounds error: copyLen=%d, bufLen=%d\n", copyLen, len(filter.buffer))
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: ERROR: Buffer wrap dest bounds error: copyLen=%d, bufLen=%d\n", copyLen, len(filter.buffer)) // LOGGING
+			}
 			return ErrBadInternalState // Cannot copy more than buffer size
 		}
 
 		// Perform the copy using Go's copy function (handles overlap)
 		copy(filter.buffer[0:copyLen], filter.buffer[srcStart:srcStart+copyLen])
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Wrapped %d samples from %d to 0.\n", copyLen, srcStart) // LOGGING
+		}
 
-		// C: filter->b_current = half_filter_chan_len ;
-		// C: filter->b_end = filter->b_current + len ;
 		filter.bCurrent = halfFilterChanLen          // New read position is after preserved lookback
 		filter.bEnd = filter.bCurrent + validDataLen // New write position is after copied valid data
 
 		// Now calculate how much space is available to load new data after the wrap
-		// C: len = MAX (filter->b_len - filter->b_current - half_filter_chan_len, 0) ; (C code uses len ambiguously)
-		// Let's use a clearer name: spaceToLoad
-		// Should be space from new b_end to end of usable buffer
-		// Usable buffer length seems to be bLen according to C calculations?
 		spaceToLoad := filter.bLen - filter.bEnd
 		requiredLen = spaceToLoad // Max we can load now
 	}
 
 	// Now, determine how much data to actually copy from input
 	// C: len = MIN ((int) (filter->in_count - filter->in_used), len) ;
-	framesAvailable := inCount - inUsed
+	framesAvailable := inCount - inUsedSamples // Use current inUsedSamples
 	if framesAvailable < 0 {
 		framesAvailable = 0
 	}
 
 	copyCount := minInt(int(framesAvailable), requiredLen) // Samples to copy
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] prepareData: requiredLen=%d, framesAvailable=%d, decided copyCount=%d (before mod channels).\n", requiredLen, framesAvailable, copyCount)
+	}
 
 	// C: len -= (len % channels) ; // Ensure whole frames
 	copyCount -= (copyCount % channels)
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] prepareData: final copyCount=%d (after mod channels).\n", copyCount)
+	}
 
 	// C: if (len < 0 || filter->b_end + len > filter->b_len) return SRC_ERR_SINC_PREPARE_DATA_BAD_LEN;
 	if copyCount < 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: ERROR: final copyCount (%d) < 0\n", copyCount) // LOGGING
+		}
 		return ErrSincPrepareDataBadLen // Cannot copy negative amount
 	}
-	// Check if copy destination is valid
 	if filter.bEnd+copyCount > filter.bLen {
-		// This check seems redundant if requiredLen was calculated correctly based on bLen.
-		// C uses filter.b_len for both usable length and allocated size? Let's stick to bLen.
-		fmt.Printf("prepareData copy bounds error: bEnd=%d, copyCount=%d, bLen=%d\n", filter.bEnd, copyCount, filter.bLen)
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: ERROR: copy exceeds bLen: bEnd=%d, copyCount=%d, bLen=%d\n", filter.bEnd, copyCount, filter.bLen) // LOGGING
+		}
 		return ErrSincPrepareDataBadLen
 	}
-	// Also check against the actual allocated buffer length
 	if filter.bEnd+copyCount > len(filter.buffer) {
-		fmt.Printf("prepareData copy alloc bounds error: bEnd=%d, copyCount=%d, allocLen=%d\n", filter.bEnd, copyCount, len(filter.buffer))
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: ERROR: copy exceeds allocLen: bEnd=%d, copyCount=%d, allocLen=%d\n", filter.bEnd, copyCount, len(filter.buffer)) // LOGGING
+		}
 		return ErrSincPrepareDataBadLen // Cannot write past allocated buffer
 	}
 
@@ -522,42 +560,70 @@ func prepareData(filter *sincFilter, channels int, data *SrcData, halfFilterChan
 		// C: memcpy (filter->buffer + filter->b_end, data->data_in + filter->in_used, len * sizeof (filter->buffer [0])) ;
 		// Ensure source slice bounds are okay
 		if currentDataOffset+copyCount > len(data.DataIn) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: ERROR: copy source bounds: offset=%d, copyCount=%d, len(DataIn)=%d\n", currentDataOffset, copyCount, len(data.DataIn)) // LOGGING
+			}
 			return ErrBadData // Trying to read past end of provided input slice
 		}
 
 		copy(filter.buffer[filter.bEnd:filter.bEnd+copyCount], data.DataIn[currentDataOffset:currentDataOffset+copyCount])
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Copied %d samples from input@%d to buffer@%d.\n", copyCount, currentDataOffset, filter.bEnd) // LOGGING
+		}
 
-		// C: filter->b_end += len ;
 		filter.bEnd += copyCount
-		// C: filter->in_used += len ;
-		inUsed += int64(copyCount) // Update local count
+		inUsedSamples += int64(copyCount) // Update local count
+	} else {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: No samples copied (copyCount=0).\n") // LOGGING
+		}
 	}
 
 	// Update SrcData with consumed frames (convert samples back to frames)
-	data.InputFramesUsed = inUsed / int64(channels)
+	// Only update if more was consumed than initially passed in
+	if inUsedSamples > initialInUsedSamples {
+		data.InputFramesUsed = inUsedSamples / int64(channels)
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Updated data.InputFramesUsed to %d.\n", data.InputFramesUsed) // LOGGING
+		}
+	} else {
+		// Ensure it reflects at least what was passed in if no new data consumed
+		data.InputFramesUsed = initialInUsedSamples / int64(channels)
+	}
 
 	// Handle End Of Input: Add zero padding if needed.
-	// C: if (filter->in_used == filter->in_count &&
-	//         filter->b_end - filter->b_current < 2 * half_filter_chan_len && data->end_of_input)
-	// This condition seems complex. Let's break it down:
-	// 1. Have we consumed all input provided *in this block*? (inUsed >= inCount)
-	// 2. Is this *actually* the end of all input? (data.EndOfInput is true)
-	// 3. Do we have less data in the buffer than needed for lookahead/lookback? (filter.bEnd - filter.bCurrent < 2 * halfFilterChanLen)
-	// If all true, we need to pad.
-	inputFullyConsumed := (inUsed >= inCount)
-	hasEnoughLookaround := (filter.bEnd - filter.bCurrent) >= (2 * halfFilterChanLen)
+	inputFullyConsumed := (inUsedSamples >= inCount) // Check if all *provided* input is used
+	currentBufferSamples := filter.bEnd - filter.bCurrent
+	if currentBufferSamples < 0 { // Handle wrap case for this check
+		currentBufferSamples += filter.bLen
+	}
+	hasEnoughLookaround := currentBufferSamples >= (2 * halfFilterChanLen)
+
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] prepareData: EOF Check: inputFullyConsumed=%t, data.EOF=%t, hasEnoughLookaround=%t (currentBufferSamples=%d vs needed=%d)\n",
+			inputFullyConsumed, data.EndOfInput, hasEnoughLookaround, currentBufferSamples, 2*halfFilterChanLen)
+	}
 
 	if inputFullyConsumed && data.EndOfInput && !hasEnoughLookaround {
-		// Need to pad with zeros
+		// ***** LOGGING *****
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Entering EOF padding logic.\n")
+		}
 
 		// C first checks if buffer needs wrapping *again* before padding
-		// C: if (filter->b_len - filter->b_end < half_filter_chan_len + 5) ... memmove ...
 		requiredPaddingSpace := halfFilterChanLen + 5 // C uses +5 margin?
 		if filter.bLen-filter.bEnd < requiredPaddingSpace {
-			// Need to wrap existing data to make space for padding at the end
+			// ***** LOGGING *****
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: Wrapping buffer before padding. bEnd=%d, bLen=%d, reqSpace=%d\n", filter.bEnd, filter.bLen, requiredPaddingSpace)
+			}
 
 			validDataLen := filter.bEnd - filter.bCurrent
 			if validDataLen < 0 {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] prepareData: ERROR: EOF pad-wrap detected bEnd (%d) < bCurrent (%d)\n", filter.bEnd, filter.bCurrent) // LOGGING
+				}
 				return ErrBadInternalState
 			}
 
@@ -566,35 +632,45 @@ func prepareData(filter *sincFilter, channels int, data *SrcData, halfFilterChan
 
 			// Bounds checks (similar to above wrap logic)
 			if srcStart < 0 {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] prepareData: ERROR: EOF pad-wrap srcStart (%d) < 0\n", srcStart) // LOGGING
+				}
 				return ErrBadInternalState
 			}
 			if srcStart+copyLen > len(filter.buffer) {
-				fmt.Printf("prepareData pad-wrap src bounds: srcStart=%d, copyLen=%d, bufLen=%d\n", srcStart, copyLen, len(filter.buffer))
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] prepareData: ERROR: EOF pad-wrap src bounds: srcStart=%d, copyLen=%d, bufLen=%d\n", srcStart, copyLen, len(filter.buffer)) // LOGGING
+				}
 				return ErrBadInternalState
 			}
 			if copyLen > len(filter.buffer) {
-				fmt.Printf("prepareData pad-wrap dest bounds: copyLen=%d, bufLen=%d\n", copyLen, len(filter.buffer))
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] prepareData: ERROR: EOF pad-wrap dest bounds: copyLen=%d, bufLen=%d\n", copyLen, len(filter.buffer)) // LOGGING
+				}
 				return ErrBadInternalState
 			}
 
 			copy(filter.buffer[0:copyLen], filter.buffer[srcStart:srcStart+copyLen])
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: EOF pad-wrap copied %d samples from %d to 0.\n", copyLen, srcStart) // LOGGING
+			}
 
 			filter.bCurrent = halfFilterChanLen
 			filter.bEnd = filter.bCurrent + validDataLen
 		}
 
 		// Now add zero padding
-		// C: filter->b_real_end = filter->b_end ;
 		filter.bRealEnd = filter.bEnd // Mark the end of actual data
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Set bRealEnd = %d.\n", filter.bRealEnd) // LOGGING
+		}
 
-		// C: len = half_filter_chan_len + 5 ; (Padding amount)
-		paddingLen := halfFilterChanLen + 5
+		paddingLen := halfFilterChanLen + 5 // Padding amount
 
-		// C: if (len < 0 || filter->b_end + len > filter->b_len) len = filter->b_len - filter->b_end ;
 		// Ensure padding doesn't exceed usable buffer length (bLen)
 		if paddingLen < 0 {
 			paddingLen = 0
-		} // Should not happen
+		}
 		if filter.bEnd+paddingLen > filter.bLen {
 			paddingLen = filter.bLen - filter.bEnd
 		}
@@ -602,300 +678,176 @@ func prepareData(filter *sincFilter, channels int, data *SrcData, halfFilterChan
 		if filter.bEnd+paddingLen > len(filter.buffer) {
 			paddingLen = len(filter.buffer) - filter.bEnd
 		}
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] prepareData: Calculated paddingLen = %d.\n", paddingLen) // LOGGING
+		}
 
-		// C: memset (filter->buffer + filter->b_end, 0, len * sizeof (filter->buffer [0])) ;
 		if paddingLen > 0 {
 			paddingSlice := filter.buffer[filter.bEnd : filter.bEnd+paddingLen]
 			for i := range paddingSlice {
 				paddingSlice[i] = 0.0
 			}
-			// C: filter->b_end += len ;
 			filter.bEnd += paddingLen
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] prepareData: Padded %d zeros. New bEnd = %d.\n", paddingLen, filter.bEnd) // LOGGING
+			}
 		}
 	}
 
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] prepareData: EXIT - bCurrent=%d, bEnd=%d, bRealEnd=%d, data.InUsed=%d. Returning ErrNoError\n", filter.bCurrent, filter.bEnd, filter.bRealEnd, data.InputFramesUsed) // LOGGING
+	}
 	return ErrNoError
 }
 
 // calcOutputSingle calculates a single interpolated output sample.
 // Corresponds to calc_output_single in src_sinc.c
 func calcOutputSingle(filter *sincFilter, increment, startFilterIndex incrementT) float64 {
+	// ***** LOGGING START *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] calcOutputSingle: ENTRY - increment=%d, startFilterIndex=%d, bCurrent=%d, bEnd=%d, bRealEnd=%d\n", increment, startFilterIndex, filter.bCurrent, filter.bEnd, filter.bRealEnd)
+	}
+	// ***** LOGGING END *****
+
 	var left, right float64 // Use float64 for accumulators
 
-	// C: max_filter_index = int_to_fp (filter->coeff_half_len) ;
-	// Use the Go helper function. coeffHalfLen is already int.
 	maxFilterIndex := intToFP(filter.coeffHalfLen)
 
 	//---------------- Apply the left half of the filter --------------------
-	// Initialize indices for the left side loop
 	filterIndex := startFilterIndex
-	// C: coeff_count = (max_filter_index - filter_index) / increment ;
-	// Integer division using fixed-point types
-	coeffCount := int((maxFilterIndex - filterIndex) / increment) // Result is int samples
-	// C: filter_index = filter_index + coeff_count * increment ;
-	filterIndex = filterIndex + incrementT(coeffCount)*increment // Start at the outermost tap used
-	// C: data_index = filter->b_current - coeff_count ;
-	dataIndex := filter.bCurrent - coeffCount // Corresponding index in the buffer
+	if increment <= 0 {
+		panic(fmt.Sprintf("calcOutputSingle: invalid increment %d", increment))
+	}
+	coeffCount := int((maxFilterIndex - filterIndex) / increment)
+	filterIndex = filterIndex + incrementT(coeffCount)*increment
+	dataIndex := filter.bCurrent - coeffCount
 
-	// C: if (data_index < 0) { ... } // Handle buffer look-back extending before start
 	if dataIndex < 0 {
-		steps := -dataIndex // How many samples we need to step forward
-		// C: assert (steps <= int_div_ceil (filter_index, increment)) ;
-		// Go check: Panic if assertion fails, indicates logic error upstream.
-		if increment <= 0 {
-			panic("calcOutputSingle: increment must be positive")
-		}
-		maxSteps := intDivCeil(int(filterIndex), int(increment)) // Use positive values for intDivCeil
-		if filterIndex < 0 {                                     // Handle case where filterIndex might start negative
+		steps := intDivCeil(-dataIndex, 1) // For single channel, step is 1
+		maxSteps := intDivCeil(int(filterIndex), int(increment))
+		if filterIndex < 0 {
 			maxSteps = intDivCeil(int(-filterIndex+increment-1), int(increment))
 		}
 		if steps > maxSteps {
 			panic(fmt.Sprintf("calcOutputSingle: buffer underflow assertion failed (steps=%d > maxSteps=%d, filterIndex=%d, increment=%d)", steps, maxSteps, filterIndex, increment))
 		}
 		filterIndex -= incrementT(steps) * increment
-		dataIndex += steps // dataIndex should now be >= 0
+		dataIndex += steps
 	}
 
 	left = 0.0
-	// C: while (filter_index >= MAKE_INCREMENT_T (0)) { ... }
+	// loopCountLeft := 0 // LOGGING
 	for filterIndex >= 0 {
-		// Calculate coefficient using linear interpolation between table entries
-		// C: fraction = fp_to_double (filter_index) ;
-		fraction := fpToDouble(filterIndex) // Fractional part as float64 [0.0, 1.0)
-		// C: indx = fp_to_int (filter_index) ;
-		indx := fpToInt(filterIndex) // Integer part (index into coeffs table)
-
-		// Coefficient interpolation: C = C[i] + frac * (C[i+1] - C[i])
-		// C: assert (indx >= 0 && indx + 1 < filter->coeff_half_len + 2) ;
-		// Go bounds check: Accessing filter.coeffs[indx] and filter.coeffs[indx+1]
-		if indx < 0 || indx+1 >= len(filter.coeffs) {
-			panic(fmt.Sprintf("calcOutputSingle: coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
-		}
-		// Perform interpolation using float64 for precision
-		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
-
-		// Accumulate: out += coeff * buffer_sample
-		// C: assert (data_index >= 0 && data_index < filter->b_len) ;
-		// C: assert (data_index < filter->b_end) ;
-		// Go bounds check for buffer access: must be within allocated length AND valid data range
-		if dataIndex < 0 || dataIndex >= filter.bLen {
-			panic(fmt.Sprintf("calcOutputSingle: left buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
-		}
-		if dataIndex >= filter.bEnd { // Check against valid data end marker
-			// Reading past valid data - indicates upstream logic error (prepareData or index calc)
-			panic(fmt.Sprintf("calcOutputSingle: left buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
-		}
-		left += icoeff * float64(filter.buffer[dataIndex])
-
-		// Update indices for next iteration
-		filterIndex -= increment
-		dataIndex++ // Move forward in buffer (older samples)
-	}
-
-	//---------------- Apply the right half of the filter -------------------
-	// Initialize indices for the right side loop
-	// C: filter_index = increment - start_filter_index ;
-	filterIndex = increment - startFilterIndex // Start relative to the *next* sample's filter position
-	// C: coeff_count = (max_filter_index - filter_index) / increment ;
-	if filterIndex > maxFilterIndex {
-		coeffCount = -1
-	} else { // Avoid negative result if filterIndex > max
-		coeffCount = int((maxFilterIndex - filterIndex) / increment)
-	}
-	// C: filter_index = filter_index + coeff_count * increment ;
-	filterIndex = filterIndex + incrementT(coeffCount)*increment
-	// C: data_index = filter->b_current + 1 + coeff_count ;
-	dataIndex = filter.bCurrent + 1 + coeffCount // Start at buffer index corresponding to tap
-
-	right = 0.0
-	// C: do { ... } while (filter_index > MAKE_INCREMENT_T (0)) ;
-	for {
-		// Calculate coefficient using linear interpolation
+		// loopCountLeft++ // LOGGING
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
 
-		// C: assert (indx < filter->coeff_half_len + 2) ; => assert (indx < len(filter.coeffs))
-		// Need indx+1 for interpolation, so check that too.
-		// Also ensure indx is not negative, although logic should prevent it here.
+		if indx < 0 || indx+1 >= len(filter.coeffs) {
+			panic(fmt.Sprintf("calcOutputSingle: left coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
+		}
+		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
+
+		// --- NEW Checks and Read (Left Loop) ---
+		var sampleValue float64 = 0.0 // Default to 0.0 (for padded area)
+		if dataIndex < 0 || dataIndex >= filter.bLen {
+			panic(fmt.Sprintf("calcOutputSingle: left buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
+		}
+		// Only read from buffer if within valid data range (before bEnd)
+		// AND within the real data range (before bRealEnd, if EOF is marked)
+		if dataIndex < filter.bEnd && (filter.bRealEnd < 0 || dataIndex < filter.bRealEnd) {
+			sampleValue = float64(filter.buffer[dataIndex]) // Read real data
+		} else if dataIndex >= filter.bEnd {
+			// This check should ideally not be hit if loop/prepareData is correct, but keep for safety
+			panic(fmt.Sprintf("calcOutputSingle: left buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
+		}
+		// If filter.bRealEnd >= 0 AND dataIndex >= filter.bRealEnd, sampleValue remains 0.0
+
+		left += icoeff * sampleValue // Accumulate (adds 0.0 if reading padded area)
+		// --- END NEW ---
+
+		filterIndex -= increment
+		dataIndex++
+	}
+	// ***** LOGGING *****
+	// fmt.Printf("[SINC_DEBUG] calcOutputSingle: Left loop executed %d times, left_accum=%.5f\n", loopCountLeft, left)
+
+	//---------------- Apply the right half of the filter -------------------
+	filterIndex = increment - startFilterIndex
+	if filterIndex > maxFilterIndex {
+		coeffCount = -1
+	} else {
+		coeffCount = int((maxFilterIndex - filterIndex) / increment)
+	}
+	filterIndex = filterIndex + incrementT(coeffCount)*increment
+	dataIndex = filter.bCurrent + 1 + coeffCount
+
+	right = 0.0
+	// loopCountRight := 0 // LOGGING
+	for {
+		// loopCountRight++ // LOGGING
+		fraction := fpToDouble(filterIndex)
+		indx := fpToInt(filterIndex)
+
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
 			panic(fmt.Sprintf("calcOutputSingle: right coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Accumulate: out += coeff * buffer_sample
-		// C: assert (data_index >= 0 && data_index < filter->b_len) ;
-		// C: assert (data_index < filter->b_end) ;
-		// Go bounds check for buffer access
+		// --- NEW Checks and Read (Right Loop) ---
+		var sampleValue float64 = 0.0 // Default to 0.0 (for padded area)
 		if dataIndex < 0 || dataIndex >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputSingle: right buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
 		}
-		if dataIndex >= filter.bEnd {
+		// Only read from buffer if within valid data range (before bEnd)
+		// AND within the real data range (before bRealEnd, if EOF is marked)
+		if dataIndex < filter.bEnd && (filter.bRealEnd < 0 || dataIndex < filter.bRealEnd) {
+			sampleValue = float64(filter.buffer[dataIndex]) // Read real data
+		} else if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputSingle: right buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
 		}
-		right += icoeff * float64(filter.buffer[dataIndex])
+		// If filter.bRealEnd >= 0 AND dataIndex >= filter.bRealEnd, sampleValue remains 0.0
 
-		// Update indices for next iteration
+		right += icoeff * sampleValue // Accumulate (adds 0.0 if reading padded area)
+		// --- END NEW ---
+
 		filterIndex -= increment
-		dataIndex-- // Move backward in buffer (newer samples)
+		dataIndex--
 
-		// Check loop condition C: while (filter_index > MAKE_INCREMENT_T (0))
 		if !(filterIndex > 0) {
 			break
 		}
-	} // End do-while loop
+	}
+	// ***** LOGGING *****
+	// fmt.Printf("[SINC_DEBUG] calcOutputSingle: Right loop executed %d times, right_accum=%.5f\n", loopCountRight, right)
+	// fmt.Printf("[SINC_DEBUG] calcOutputSingle: EXIT - Returning %.5f\n", left+right)
 
-	// C: return (left + right) ;
 	return left + right
-}
-
-// --- TODO: Implement Processing & Helper Functions ---
-
-// sincMonoVariProcess handles mono data with potentially varying sample rate ratio.
-// Corresponds to sinc_mono_vari_process in src_sinc.c (Corrected version)
-func sincMonoVariProcess(state *srcState, data *SrcData) ErrorCode {
-	filter, ok := state.privateData.(*sincFilter)
-	if !ok || filter == nil {
-		return ErrBadState
-	}
-	if state.channels != 1 {
-		return ErrBadInternalState
-	}
-	inputIndex := state.lastPosition
-	srcRatio := state.lastRatio
-	var increment, startFilterIndex incrementT
-	var halfFilterChanLen, samplesInHand int
-	outCountSamples := data.OutputFrames * int64(state.channels)
-	data.InputFramesUsed = 0
-	data.OutputFramesGen = 0
-	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0
-
-	if isBadSrcRatio(srcRatio) {
-		if isBadSrcRatio(data.SrcRatio) {
-			return ErrBadSrcRatio
-		}
-		srcRatio = data.SrcRatio
-		state.lastRatio = srcRatio
-	}
-	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
-	if filter.indexInc <= 0 {
-		return ErrBadInternalState
-	}
-	count := filterCoeffsLen / float64(filter.indexInc)
-	minRatio := minFloat64(state.lastRatio, data.SrcRatio)
-	if minRatio < (1.0 / srcMaxRatio) {
-		minRatio = 1.0 / srcMaxRatio
-	}
-	if minRatio < 1.0 && minRatio != 0 {
-		count /= minRatio
-	}
-	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
-	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
-	if filter.bLen <= 0 {
-		return ErrBadInternalState
-	}
-	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-	inputIndex = fmodOne(inputIndex)
-
-	for outGenSamples < outCountSamples {
-		if filter.bEnd >= filter.bCurrent {
-			samplesInHand = filter.bEnd - filter.bCurrent
-		} else {
-			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-		}
-		if samplesInHand <= halfFilterChanLen {
-			data.InputFramesUsed = inUsedSamples / int64(state.channels)
-			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
-			if errCode != ErrNoError {
-				state.errCode = errCode
-				return errCode
-			}
-			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-			if filter.bEnd >= filter.bCurrent {
-				samplesInHand = filter.bEnd - filter.bCurrent
-			} else {
-				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-			}
-			if samplesInHand <= halfFilterChanLen {
-				break
-			}
-		}
-		if filter.bRealEnd >= 0 {
-			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
-			if maxIndexNeeded >= filter.bRealEnd {
-				break
-			}
-		}
-		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
-			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) {
-				if srcRatio < 1.0/srcMaxRatio {
-					srcRatio = 1.0 / srcMaxRatio
-				}
-				if srcRatio > srcMaxRatio {
-					srcRatio = srcMaxRatio
-				}
-			}
-		}
-		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
-		increment = doubleToFP(floatIncrement)
-		if increment == 0 {
-			return ErrBadSrcRatio
-		}
-		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
-		scaleFactor := floatIncrement / float64(filter.indexInc)
-		outputSample := scaleFactor * calcOutputSingle(filter, increment, startFilterIndex)
-		if int(outGenSamples) >= len(data.DataOut) {
-			return ErrBadData
-		}
-		data.DataOut[outGenSamples] = float32(outputSample)
-		outGenSamples++
-		if srcRatio == 0 {
-			return ErrBadSrcRatio
-		}
-		inputIndex += 1.0 / srcRatio
-		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
-		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-		inputIndex = fmodOne(inputIndex)
-	}
-	state.lastPosition = inputIndex
-	state.lastRatio = srcRatio
-	data.OutputFramesGen = outGenSamples / int64(state.channels)
-	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-	return ErrNoError
 }
 
 // calcOutputStereo calculates a pair of interpolated stereo output samples.
 // Corresponds to calc_output_stereo in src_sinc.c
 func calcOutputStereo(filter *sincFilter, channels int, increment, startFilterIndex incrementT, scale float64, output []float32) {
-	// Ensure output slice has space for 2 samples
 	if len(output) < 2 {
 		panic(fmt.Sprintf("calcOutputStereo: output slice too small (len=%d, need 2)", len(output)))
 	}
-	// Ensure channels argument is correct (although likely always 2 when called)
 	if channels != 2 {
 		panic(fmt.Sprintf("calcOutputStereo called with incorrect channel count: %d", channels))
 	}
 
-	var left, right [2]float64 // Use float64 arrays for stereo accumulators
-
+	var left, right [2]float64
 	maxFilterIndex := intToFP(filter.coeffHalfLen)
 
 	//---------------- Apply the left half of the filter --------------------
 	filterIndex := startFilterIndex
+	if increment <= 0 {
+		panic(fmt.Sprintf("calcOutputStereo: invalid increment %d", increment))
+	}
 	coeffCount := int((maxFilterIndex - filterIndex) / increment)
 	filterIndex = filterIndex + incrementT(coeffCount)*increment
-	// dataIndex steps by 'channels' (2) for each coefficient tap
 	dataIndex := filter.bCurrent - channels*coeffCount
 
 	if dataIndex < 0 {
-		// Need to step forward; calculate steps based on channel pairs
-		steps := intDivCeil(-dataIndex, channels) // Divide by channel count (2)
-
-		// Assertion check
-		if increment <= 0 {
-			panic("calcOutputStereo: increment must be positive")
-		}
+		steps := intDivCeil(-dataIndex, channels)
 		maxSteps := intDivCeil(int(filterIndex), int(increment))
 		if filterIndex < 0 {
 			maxSteps = intDivCeil(int(-filterIndex+increment-1), int(increment))
@@ -903,36 +855,47 @@ func calcOutputStereo(filter *sincFilter, channels int, increment, startFilterIn
 		if steps > maxSteps {
 			panic(fmt.Sprintf("calcOutputStereo: buffer underflow assertion failed (steps=%d > maxSteps=%d, filterIndex=%d, increment=%d)", steps, maxSteps, filterIndex, increment))
 		}
-
 		filterIndex -= incrementT(steps) * increment
-		dataIndex += steps * channels // Step forward by sample pairs
+		dataIndex += steps * channels
 	}
 
 	left[0], left[1] = 0.0, 0.0
 	for filterIndex >= 0 {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
-		// Coefficient bounds check
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
 			panic(fmt.Sprintf("calcOutputStereo: left coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (for both channels: dataIndex and dataIndex+1)
-		if dataIndex < 0 || dataIndex+1 >= filter.bLen {
+		// --- NEW Checks and Read (Left Loop - Stereo) ---
+		endDataIdx := dataIndex + 1 // Check up to the second channel
+		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputStereo: left buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
 		}
-		if dataIndex+1 >= filter.bEnd { // Check against valid data end marker
+
+		canReadCh0 := dataIndex < filter.bEnd && (filter.bRealEnd < 0 || dataIndex < filter.bRealEnd)
+		canReadCh1 := endDataIdx < filter.bEnd && (filter.bRealEnd < 0 || endDataIdx < filter.bRealEnd)
+
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputStereo: left buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
+		} // Should ideally check endDataIdx too? C only checks index+1 < b_end
+
+		sampleValueCh0 := 0.0
+		if canReadCh0 {
+			sampleValueCh0 = float64(filter.buffer[dataIndex])
+		}
+		sampleValueCh1 := 0.0
+		if canReadCh1 {
+			sampleValueCh1 = float64(filter.buffer[dataIndex+1])
 		}
 
-		// Accumulate for both channels
-		left[0] += icoeff * float64(filter.buffer[dataIndex])
-		left[1] += icoeff * float64(filter.buffer[dataIndex+1])
+		left[0] += icoeff * sampleValueCh0
+		left[1] += icoeff * sampleValueCh1
+		// --- END NEW ---
 
 		filterIndex -= increment
-		dataIndex += channels // Move to the next sample pair (older data)
+		dataIndex += channels
 	}
 
 	//---------------- Apply the right half of the filter -------------------
@@ -943,186 +906,80 @@ func calcOutputStereo(filter *sincFilter, channels int, increment, startFilterIn
 		coeffCount = int((maxFilterIndex - filterIndex) / increment)
 	}
 	filterIndex = filterIndex + incrementT(coeffCount)*increment
-	dataIndex = filter.bCurrent + channels*(1+coeffCount) // Start after center point
+	dataIndex = filter.bCurrent + channels*(1+coeffCount)
 
 	right[0], right[1] = 0.0, 0.0
 	for {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
-		// Coefficient bounds check
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
 			panic(fmt.Sprintf("calcOutputStereo: right coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (dataIndex and dataIndex+1)
-		if dataIndex < 0 || dataIndex+1 >= filter.bLen {
+		// --- NEW Checks and Read (Right Loop - Stereo) ---
+		endDataIdx := dataIndex + 1
+		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputStereo: right buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
 		}
-		if dataIndex+1 >= filter.bEnd {
+
+		canReadCh0 := dataIndex < filter.bEnd && (filter.bRealEnd < 0 || dataIndex < filter.bRealEnd)
+		canReadCh1 := endDataIdx < filter.bEnd && (filter.bRealEnd < 0 || endDataIdx < filter.bRealEnd)
+
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputStereo: right buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
 		}
 
-		// Accumulate for both channels
-		right[0] += icoeff * float64(filter.buffer[dataIndex])
-		right[1] += icoeff * float64(filter.buffer[dataIndex+1])
+		sampleValueCh0 := 0.0
+		if canReadCh0 {
+			sampleValueCh0 = float64(filter.buffer[dataIndex])
+		}
+		sampleValueCh1 := 0.0
+		if canReadCh1 {
+			sampleValueCh1 = float64(filter.buffer[dataIndex+1])
+		}
+
+		right[0] += icoeff * sampleValueCh0
+		right[1] += icoeff * sampleValueCh1
+		// --- END NEW ---
 
 		filterIndex -= increment
-		dataIndex -= channels // Move to the previous sample pair (newer data)
+		dataIndex -= channels
 
 		if !(filterIndex > 0) {
 			break
 		}
-	} // End do-while loop
+	}
 
 	// --- Combine, scale, and write output ---
 	output[0] = float32(scale * (left[0] + right[0]))
 	output[1] = float32(scale * (left[1] + right[1]))
 }
 
-// sincStereoVariProcess handles stereo data with potentially varying sample rate ratio.
-// Corresponds to sinc_stereo_vari_process in src_sinc.c
-func sincStereoVariProcess(state *srcState, data *SrcData) ErrorCode {
-	filter, ok := state.privateData.(*sincFilter)
-	if !ok || filter == nil {
-		return ErrBadState
-	}
-	if state.channels != 2 {
-		return ErrBadInternalState
-	}
-	inputIndex := state.lastPosition
-	srcRatio := state.lastRatio
-	var increment, startFilterIndex incrementT
-	var halfFilterChanLen, samplesInHand int
-	outCountSamples := data.OutputFrames * int64(state.channels)
-	data.InputFramesUsed = 0
-	data.OutputFramesGen = 0
-	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0
-	if isBadSrcRatio(srcRatio) {
-		if isBadSrcRatio(data.SrcRatio) {
-			return ErrBadSrcRatio
-		}
-		srcRatio = data.SrcRatio
-		state.lastRatio = srcRatio
-	}
-	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
-	if filter.indexInc <= 0 {
-		return ErrBadInternalState
-	}
-	count := filterCoeffsLen / float64(filter.indexInc)
-	minRatio := minFloat64(state.lastRatio, data.SrcRatio)
-	if minRatio < (1.0 / srcMaxRatio) {
-		minRatio = 1.0 / srcMaxRatio
-	}
-	if minRatio < 1.0 && minRatio != 0 {
-		count /= minRatio
-	}
-	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
-	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
-	if filter.bLen <= 0 {
-		return ErrBadInternalState
-	}
-	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-	inputIndex = fmodOne(inputIndex)
-	for outGenSamples < outCountSamples {
-		if filter.bEnd >= filter.bCurrent {
-			samplesInHand = filter.bEnd - filter.bCurrent
-		} else {
-			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-		}
-		if samplesInHand <= halfFilterChanLen {
-			data.InputFramesUsed = inUsedSamples / int64(state.channels)
-			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
-			if errCode != ErrNoError {
-				state.errCode = errCode
-				return errCode
-			}
-			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-			if filter.bEnd >= filter.bCurrent {
-				samplesInHand = filter.bEnd - filter.bCurrent
-			} else {
-				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-			}
-			if samplesInHand <= halfFilterChanLen {
-				break
-			}
-		}
-		if filter.bRealEnd >= 0 {
-			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
-			if maxIndexNeeded >= filter.bRealEnd {
-				break
-			}
-		}
-		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
-			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) {
-				if srcRatio < 1.0/srcMaxRatio {
-					srcRatio = 1.0 / srcMaxRatio
-				}
-				if srcRatio > srcMaxRatio {
-					srcRatio = srcMaxRatio
-				}
-			}
-		}
-		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
-		increment = doubleToFP(floatIncrement)
-		if increment == 0 {
-			return ErrBadSrcRatio
-		}
-		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
-		scaleFactor := floatIncrement / float64(filter.indexInc)
-		outPos := int(outGenSamples)
-		if outPos+state.channels > len(data.DataOut) {
-			break
-		}
-		outputSlice := data.DataOut[outPos : outPos+state.channels]
-		calcOutputStereo(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
-		outGenSamples += int64(state.channels)
-		if srcRatio == 0 {
-			return ErrBadSrcRatio
-		}
-		inputIndex += 1.0 / srcRatio
-		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
-		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-		inputIndex = fmodOne(inputIndex)
-	}
-	state.lastPosition = inputIndex
-	state.lastRatio = srcRatio
-	data.OutputFramesGen = outGenSamples / int64(state.channels)
-	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-	return ErrNoError
-}
-
 // calcOutputQuad calculates a set of 4 interpolated quad output samples.
 // Corresponds to calc_output_quad in src_sinc.c
 func calcOutputQuad(filter *sincFilter, channels int, increment, startFilterIndex incrementT, scale float64, output []float32) {
-	// Ensure output slice has space for 4 samples
 	if len(output) < 4 {
 		panic(fmt.Sprintf("calcOutputQuad: output slice too small (len=%d, need 4)", len(output)))
 	}
-	// Ensure channels argument is correct
 	if channels != 4 {
 		panic(fmt.Sprintf("calcOutputQuad called with incorrect channel count: %d", channels))
 	}
 
-	var left, right [4]float64 // Use float64 arrays for quad accumulators
-
+	var left, right [4]float64
 	maxFilterIndex := intToFP(filter.coeffHalfLen)
 
 	//---------------- Apply the left half of the filter --------------------
 	filterIndex := startFilterIndex
+	if increment <= 0 {
+		panic(fmt.Sprintf("calcOutputQuad: invalid increment %d", increment))
+	}
 	coeffCount := int((maxFilterIndex - filterIndex) / increment)
 	filterIndex = filterIndex + incrementT(coeffCount)*increment
 	dataIndex := filter.bCurrent - channels*coeffCount
 
 	if dataIndex < 0 {
-		steps := intDivCeil(-dataIndex, channels) // Divide by 4
-
-		if increment <= 0 {
-			panic("calcOutputQuad: increment must be positive")
-		}
+		steps := intDivCeil(-dataIndex, channels)
 		maxSteps := intDivCeil(int(filterIndex), int(increment))
 		if filterIndex < 0 {
 			maxSteps = intDivCeil(int(-filterIndex+increment-1), int(increment))
@@ -1130,37 +987,42 @@ func calcOutputQuad(filter *sincFilter, channels int, increment, startFilterInde
 		if steps > maxSteps {
 			panic(fmt.Sprintf("calcOutputQuad: buffer underflow assertion failed (steps=%d > maxSteps=%d, filterIndex=%d, increment=%d)", steps, maxSteps, filterIndex, increment))
 		}
-
 		filterIndex -= incrementT(steps) * increment
-		dataIndex += steps * channels // Step forward by sample groups of 4
+		dataIndex += steps * channels
 	}
 
-	// Initialize left accumulators
-	left[0], left[1], left[2], left[3] = 0.0, 0.0, 0.0, 0.0
+	for ch := 0; ch < 4; ch++ {
+		left[ch] = 0.0
+	}
 	for filterIndex >= 0 {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
 			panic(fmt.Sprintf("calcOutputQuad: left coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (for all 4 channels: dataIndex to dataIndex+3)
-		if dataIndex < 0 || dataIndex+3 >= filter.bLen {
+		// --- NEW Checks and Read (Left Loop - Quad) ---
+		endDataIdx := dataIndex + 3 // Check up to the last channel
+		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputQuad: left buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
 		}
-		if dataIndex+3 >= filter.bEnd { // Check against valid data end marker
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputQuad: left buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
-		}
+		} // C checks +3 < b_end
 
-		// Accumulate for all 4 channels
 		for ch := 0; ch < 4; ch++ {
-			left[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
+			sampleValue := 0.0
+			checkIdx := dataIndex + ch
+			if checkIdx < filter.bEnd && (filter.bRealEnd < 0 || checkIdx < filter.bRealEnd) {
+				sampleValue = float64(filter.buffer[checkIdx])
+			}
+			left[ch] += icoeff * sampleValue
 		}
+		// --- END NEW ---
 
 		filterIndex -= increment
-		dataIndex += channels // Move to the next sample group (older data)
+		dataIndex += channels
 	}
 
 	//---------------- Apply the right half of the filter -------------------
@@ -1171,39 +1033,45 @@ func calcOutputQuad(filter *sincFilter, channels int, increment, startFilterInde
 		coeffCount = int((maxFilterIndex - filterIndex) / increment)
 	}
 	filterIndex = filterIndex + incrementT(coeffCount)*increment
-	dataIndex = filter.bCurrent + channels*(1+coeffCount) // Start after center point
+	dataIndex = filter.bCurrent + channels*(1+coeffCount)
 
-	// Initialize right accumulators
-	right[0], right[1], right[2], right[3] = 0.0, 0.0, 0.0, 0.0
+	for ch := 0; ch < 4; ch++ {
+		right[ch] = 0.0
+	}
 	for {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
 			panic(fmt.Sprintf("calcOutputQuad: right coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (dataIndex to dataIndex+3)
-		if dataIndex < 0 || dataIndex+3 >= filter.bLen {
+		// --- NEW Checks and Read (Right Loop - Quad) ---
+		endDataIdx := dataIndex + 3
+		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputQuad: right buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
 		}
-		if dataIndex+3 >= filter.bEnd {
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputQuad: right buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
 		}
 
-		// Accumulate for all 4 channels
 		for ch := 0; ch < 4; ch++ {
-			right[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
+			sampleValue := 0.0
+			checkIdx := dataIndex + ch
+			if checkIdx < filter.bEnd && (filter.bRealEnd < 0 || checkIdx < filter.bRealEnd) {
+				sampleValue = float64(filter.buffer[checkIdx])
+			}
+			right[ch] += icoeff * sampleValue
 		}
+		// --- END NEW ---
 
 		filterIndex -= increment
-		dataIndex -= channels // Move to the previous sample group (newer data)
+		dataIndex -= channels
 
 		if !(filterIndex > 0) {
 			break
 		}
-	} // End do-while loop
+	}
 
 	// --- Combine, scale, and write output ---
 	for ch := 0; ch < 4; ch++ {
@@ -1211,148 +1079,30 @@ func calcOutputQuad(filter *sincFilter, channels int, increment, startFilterInde
 	}
 }
 
-// sincQuadVariProcess handles quad audio data with potentially varying sample rate ratio.
-// Corresponds to sinc_quad_vari_process in src_sinc.c
-func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
-	filter, ok := state.privateData.(*sincFilter)
-	if !ok || filter == nil {
-		return ErrBadState
-	}
-	if state.channels != 4 {
-		return ErrBadInternalState
-	}
-	inputIndex := state.lastPosition
-	srcRatio := state.lastRatio
-	var increment, startFilterIndex incrementT
-	var halfFilterChanLen, samplesInHand int
-	outCountSamples := data.OutputFrames * int64(state.channels)
-	data.InputFramesUsed = 0
-	data.OutputFramesGen = 0
-	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0
-	if isBadSrcRatio(srcRatio) {
-		if isBadSrcRatio(data.SrcRatio) {
-			return ErrBadSrcRatio
-		}
-		srcRatio = data.SrcRatio
-		state.lastRatio = srcRatio
-	}
-	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
-	if filter.indexInc <= 0 {
-		return ErrBadInternalState
-	}
-	count := filterCoeffsLen / float64(filter.indexInc)
-	minRatio := minFloat64(state.lastRatio, data.SrcRatio)
-	if minRatio < (1.0 / srcMaxRatio) {
-		minRatio = 1.0 / srcMaxRatio
-	}
-	if minRatio < 1.0 && minRatio != 0 {
-		count /= minRatio
-	}
-	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
-	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
-	if filter.bLen <= 0 {
-		return ErrBadInternalState
-	}
-	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-	inputIndex = fmodOne(inputIndex)
-	for outGenSamples < outCountSamples {
-		if filter.bEnd >= filter.bCurrent {
-			samplesInHand = filter.bEnd - filter.bCurrent
-		} else {
-			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-		}
-		if samplesInHand <= halfFilterChanLen {
-			data.InputFramesUsed = inUsedSamples / int64(state.channels)
-			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
-			if errCode != ErrNoError {
-				state.errCode = errCode
-				return errCode
-			}
-			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-			if filter.bEnd >= filter.bCurrent {
-				samplesInHand = filter.bEnd - filter.bCurrent
-			} else {
-				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-			}
-			if samplesInHand <= halfFilterChanLen {
-				break
-			}
-		}
-		if filter.bRealEnd >= 0 {
-			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
-			if maxIndexNeeded >= filter.bRealEnd {
-				break
-			}
-		}
-		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
-			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) {
-				if srcRatio < 1.0/srcMaxRatio {
-					srcRatio = 1.0 / srcMaxRatio
-				}
-				if srcRatio > srcMaxRatio {
-					srcRatio = srcMaxRatio
-				}
-			}
-		}
-		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
-		increment = doubleToFP(floatIncrement)
-		if increment == 0 {
-			return ErrBadSrcRatio
-		}
-		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
-		scaleFactor := floatIncrement / float64(filter.indexInc)
-		outPos := int(outGenSamples)
-		if outPos+state.channels > len(data.DataOut) {
-			break
-		}
-		outputSlice := data.DataOut[outPos : outPos+state.channels]
-		calcOutputQuad(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
-		outGenSamples += int64(state.channels)
-		if srcRatio == 0 {
-			return ErrBadSrcRatio
-		}
-		inputIndex += 1.0 / srcRatio
-		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
-		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-		inputIndex = fmodOne(inputIndex)
-	}
-	state.lastPosition = inputIndex
-	state.lastRatio = srcRatio
-	data.OutputFramesGen = outGenSamples / int64(state.channels)
-	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-	return ErrNoError
-}
-
 // calcOutputHex calculates a set of 6 interpolated hex output samples.
 // Corresponds to calc_output_hex in src_sinc.c
 func calcOutputHex(filter *sincFilter, channels int, increment, startFilterIndex incrementT, scale float64, output []float32) {
-	// Ensure output slice has space for 6 samples
 	if len(output) < 6 {
 		panic(fmt.Sprintf("calcOutputHex: output slice too small (len=%d, need 6)", len(output)))
 	}
-	// Ensure channels argument is correct
 	if channels != 6 {
 		panic(fmt.Sprintf("calcOutputHex called with incorrect channel count: %d", channels))
 	}
 
-	var left, right [6]float64 // Use float64 arrays for hex accumulators
-
+	var left, right [6]float64
 	maxFilterIndex := intToFP(filter.coeffHalfLen)
 
 	//---------------- Apply the left half of the filter --------------------
 	filterIndex := startFilterIndex
+	if increment <= 0 {
+		panic(fmt.Sprintf("calcOutputHex: invalid increment %d", increment))
+	}
 	coeffCount := int((maxFilterIndex - filterIndex) / increment)
 	filterIndex = filterIndex + incrementT(coeffCount)*increment
-	dataIndex := filter.bCurrent - channels*coeffCount // channels = 6
+	dataIndex := filter.bCurrent - channels*coeffCount
 
 	if dataIndex < 0 {
-		steps := intDivCeil(-dataIndex, channels) // Divide by 6
-
-		if increment <= 0 {
-			panic("calcOutputHex: increment must be positive")
-		}
+		steps := intDivCeil(-dataIndex, channels)
 		maxSteps := intDivCeil(int(filterIndex), int(increment))
 		if filterIndex < 0 {
 			maxSteps = intDivCeil(int(-filterIndex+increment-1), int(increment))
@@ -1360,39 +1110,42 @@ func calcOutputHex(filter *sincFilter, channels int, increment, startFilterIndex
 		if steps > maxSteps {
 			panic(fmt.Sprintf("calcOutputHex: buffer underflow assertion failed (steps=%d > maxSteps=%d, filterIndex=%d, increment=%d)", steps, maxSteps, filterIndex, increment))
 		}
-
 		filterIndex -= incrementT(steps) * increment
-		dataIndex += steps * channels // Step forward by sample groups of 6
+		dataIndex += steps * channels
 	}
 
-	// Initialize left accumulators
 	for ch := 0; ch < 6; ch++ {
 		left[ch] = 0.0
 	}
 	for filterIndex >= 0 {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
 			panic(fmt.Sprintf("calcOutputHex: left coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (for all 6 channels: dataIndex to dataIndex+5)
-		if dataIndex < 0 || dataIndex+5 >= filter.bLen {
+		// --- NEW Checks and Read (Left Loop - Hex) ---
+		endDataIdx := dataIndex + 5
+		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputHex: left buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
 		}
-		if dataIndex+5 >= filter.bEnd { // Check against valid data end marker
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputHex: left buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
 		}
 
-		// Accumulate for all 6 channels
 		for ch := 0; ch < 6; ch++ {
-			left[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
+			sampleValue := 0.0
+			checkIdx := dataIndex + ch
+			if checkIdx < filter.bEnd && (filter.bRealEnd < 0 || checkIdx < filter.bRealEnd) {
+				sampleValue = float64(filter.buffer[checkIdx])
+			}
+			left[ch] += icoeff * sampleValue
 		}
+		// --- END NEW ---
 
 		filterIndex -= increment
-		dataIndex += channels // Move to the next sample group (older data)
+		dataIndex += channels
 	}
 
 	//---------------- Apply the right half of the filter -------------------
@@ -1403,160 +1156,50 @@ func calcOutputHex(filter *sincFilter, channels int, increment, startFilterIndex
 		coeffCount = int((maxFilterIndex - filterIndex) / increment)
 	}
 	filterIndex = filterIndex + incrementT(coeffCount)*increment
-	dataIndex = filter.bCurrent + channels*(1+coeffCount) // Start after center point
+	dataIndex = filter.bCurrent + channels*(1+coeffCount)
 
-	// Initialize right accumulators
 	for ch := 0; ch < 6; ch++ {
 		right[ch] = 0.0
 	}
 	for {
 		fraction := fpToDouble(filterIndex)
 		indx := fpToInt(filterIndex)
-
 		if indx < 0 || indx+1 >= len(filter.coeffs) {
 			panic(fmt.Sprintf("calcOutputHex: right coefficient index out of bounds (indx=%d, len=%d)", indx, len(filter.coeffs)))
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
-		// Buffer bounds check (dataIndex to dataIndex+5)
-		if dataIndex < 0 || dataIndex+5 >= filter.bLen {
+		// --- NEW Checks and Read (Right Loop - Hex) ---
+		endDataIdx := dataIndex + 5
+		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputHex: right buffer index out of allocated bounds (dataIndex=%d, bLen=%d)", dataIndex, filter.bLen))
 		}
-		if dataIndex+5 >= filter.bEnd {
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputHex: right buffer index out of valid data range (dataIndex=%d, bEnd=%d)", dataIndex, filter.bEnd))
 		}
 
-		// Accumulate for all 6 channels
 		for ch := 0; ch < 6; ch++ {
-			right[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
+			sampleValue := 0.0
+			checkIdx := dataIndex + ch
+			if checkIdx < filter.bEnd && (filter.bRealEnd < 0 || checkIdx < filter.bRealEnd) {
+				sampleValue = float64(filter.buffer[checkIdx])
+			}
+			right[ch] += icoeff * sampleValue
 		}
+		// --- END NEW ---
 
 		filterIndex -= increment
-		dataIndex -= channels // Move to the previous sample group (newer data)
+		dataIndex -= channels
 
 		if !(filterIndex > 0) {
 			break
 		}
-	} // End do-while loop
+	}
 
 	// --- Combine, scale, and write output ---
 	for ch := 0; ch < 6; ch++ {
 		output[ch] = float32(scale * (left[ch] + right[ch]))
 	}
-}
-
-// sincHexVariProcess handles 6-channel audio data with potentially varying sample rate ratio.
-// Corresponds to sinc_hex_vari_process in src_sinc.c
-func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
-	filter, ok := state.privateData.(*sincFilter)
-	if !ok || filter == nil {
-		return ErrBadState
-	}
-	if state.channels != 6 {
-		return ErrBadInternalState
-	}
-	inputIndex := state.lastPosition
-	srcRatio := state.lastRatio
-	var increment, startFilterIndex incrementT
-	var halfFilterChanLen, samplesInHand int
-	outCountSamples := data.OutputFrames * int64(state.channels)
-	data.InputFramesUsed = 0
-	data.OutputFramesGen = 0
-	var inUsedSamples int64 = 0
-	var outGenSamples int64 = 0
-	if isBadSrcRatio(srcRatio) {
-		if isBadSrcRatio(data.SrcRatio) {
-			return ErrBadSrcRatio
-		}
-		srcRatio = data.SrcRatio
-		state.lastRatio = srcRatio
-	}
-	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
-	if filter.indexInc <= 0 {
-		return ErrBadInternalState
-	}
-	count := filterCoeffsLen / float64(filter.indexInc)
-	minRatio := minFloat64(state.lastRatio, data.SrcRatio)
-	if minRatio < (1.0 / srcMaxRatio) {
-		minRatio = 1.0 / srcMaxRatio
-	}
-	if minRatio < 1.0 && minRatio != 0 {
-		count /= minRatio
-	}
-	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
-	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
-	if filter.bLen <= 0 {
-		return ErrBadInternalState
-	}
-	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-	inputIndex = fmodOne(inputIndex)
-	for outGenSamples < outCountSamples {
-		if filter.bEnd >= filter.bCurrent {
-			samplesInHand = filter.bEnd - filter.bCurrent
-		} else {
-			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-		}
-		if samplesInHand <= halfFilterChanLen {
-			data.InputFramesUsed = inUsedSamples / int64(state.channels)
-			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
-			if errCode != ErrNoError {
-				state.errCode = errCode
-				return errCode
-			}
-			inUsedSamples = data.InputFramesUsed * int64(state.channels)
-			if filter.bEnd >= filter.bCurrent {
-				samplesInHand = filter.bEnd - filter.bCurrent
-			} else {
-				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
-			}
-			if samplesInHand <= halfFilterChanLen {
-				break
-			}
-		}
-		if filter.bRealEnd >= 0 {
-			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
-			if maxIndexNeeded >= filter.bRealEnd {
-				break
-			}
-		}
-		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
-			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
-			if isBadSrcRatio(srcRatio) {
-				if srcRatio < 1.0/srcMaxRatio {
-					srcRatio = 1.0 / srcMaxRatio
-				}
-				if srcRatio > srcMaxRatio {
-					srcRatio = srcMaxRatio
-				}
-			}
-		}
-		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
-		increment = doubleToFP(floatIncrement)
-		if increment == 0 {
-			return ErrBadSrcRatio
-		}
-		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
-		scaleFactor := floatIncrement / float64(filter.indexInc)
-		outPos := int(outGenSamples)
-		if outPos+state.channels > len(data.DataOut) {
-			break
-		}
-		outputSlice := data.DataOut[outPos : outPos+state.channels]
-		calcOutputHex(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
-		outGenSamples += int64(state.channels)
-		if srcRatio == 0 {
-			return ErrBadSrcRatio
-		}
-		inputIndex += 1.0 / srcRatio
-		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
-		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
-		inputIndex = fmodOne(inputIndex)
-	}
-	state.lastPosition = inputIndex
-	state.lastRatio = srcRatio
-	data.OutputFramesGen = outGenSamples / int64(state.channels)
-	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-	return ErrNoError
 }
 
 // calcOutputMulti calculates a set of interpolated output samples for multiple channels.
@@ -1565,34 +1208,30 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 	if len(output) < channels {
 		panic(fmt.Sprintf("calcOutputMulti: output slice too small (len=%d, need %d)", len(output), channels))
 	}
-	// Ensure scratch arrays are large enough (should be maxChannels)
 	if channels > maxChannels {
 		panic(fmt.Sprintf("calcOutputMulti: channel count %d exceeds maxChannels %d", channels, maxChannels))
 	}
 
-	// Use the scratch arrays from the filter struct
-	left := filter.leftCalc[:channels]   // Slice to the number of channels needed
-	right := filter.rightCalc[:channels] // Slice to the number of channels needed
+	left := filter.leftCalc[:channels]
+	right := filter.rightCalc[:channels]
 
-	// Zero out scratch arrays before accumulating
 	for ch := 0; ch < channels; ch++ {
-		left[ch] = 0.0
-		right[ch] = 0.0
+		left[ch], right[ch] = 0.0, 0.0
 	}
 
 	maxFilterIndex := intToFP(filter.coeffHalfLen)
 
 	//---------------- Apply the left half of the filter --------------------
 	filterIndex := startFilterIndex
+	if increment <= 0 {
+		panic(fmt.Sprintf("calcOutputMulti: invalid increment %d", increment))
+	}
 	coeffCount := int((maxFilterIndex - filterIndex) / increment)
 	filterIndex = filterIndex + incrementT(coeffCount)*increment
 	dataIndex := filter.bCurrent - channels*coeffCount
 
 	if dataIndex < 0 {
 		steps := intDivCeil(-dataIndex, channels)
-		if increment <= 0 {
-			panic("calcOutputMulti: increment must be positive")
-		}
 		maxSteps := intDivCeil(int(filterIndex), int(increment))
 		if filterIndex < 0 {
 			maxSteps = intDivCeil(int(-filterIndex+increment-1), int(increment))
@@ -1612,17 +1251,26 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
+		// --- NEW Checks and Read (Left Loop - Multi) ---
 		endDataIdx := dataIndex + channels - 1
 		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputMulti: left buffer index out of allocated bounds (dataIndex=%d, channels=%d, bLen=%d)", dataIndex, channels, filter.bLen))
 		}
-		if endDataIdx >= filter.bEnd {
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputMulti: left buffer index out of valid data range (dataIndex=%d, channels=%d, bEnd=%d)", dataIndex, channels, filter.bEnd))
-		}
+		} // C checks +channels-1 < b_end
 
 		for ch := 0; ch < channels; ch++ {
-			left[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
+			sampleValue := 0.0
+			checkIdx := dataIndex + ch
+			// Only read if index is within BOTH bEnd and bRealEnd (if set)
+			if checkIdx < filter.bEnd && (filter.bRealEnd < 0 || checkIdx < filter.bRealEnd) {
+				sampleValue = float64(filter.buffer[checkIdx])
+			}
+			left[ch] += icoeff * sampleValue
 		}
+		// --- END NEW ---
+
 		filterIndex -= increment
 		dataIndex += channels
 	}
@@ -1646,17 +1294,25 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 		}
 		icoeff := float64(filter.coeffs[indx]) + fraction*float64(filter.coeffs[indx+1]-filter.coeffs[indx])
 
+		// --- NEW Checks and Read (Right Loop - Multi) ---
 		endDataIdx := dataIndex + channels - 1
 		if dataIndex < 0 || endDataIdx >= filter.bLen {
 			panic(fmt.Sprintf("calcOutputMulti: right buffer index out of allocated bounds (dataIndex=%d, channels=%d, bLen=%d)", dataIndex, channels, filter.bLen))
 		}
-		if endDataIdx >= filter.bEnd {
+		if dataIndex >= filter.bEnd {
 			panic(fmt.Sprintf("calcOutputMulti: right buffer index out of valid data range (dataIndex=%d, channels=%d, bEnd=%d)", dataIndex, channels, filter.bEnd))
 		}
 
 		for ch := 0; ch < channels; ch++ {
-			right[ch] += icoeff * float64(filter.buffer[dataIndex+ch])
+			sampleValue := 0.0
+			checkIdx := dataIndex + ch
+			if checkIdx < filter.bEnd && (filter.bRealEnd < 0 || checkIdx < filter.bRealEnd) {
+				sampleValue = float64(filter.buffer[checkIdx])
+			}
+			right[ch] += icoeff * sampleValue
 		}
+		// --- END NEW ---
+
 		filterIndex -= increment
 		dataIndex -= channels
 		if !(filterIndex > 0) {
@@ -1670,11 +1326,1079 @@ func calcOutputMulti(filter *sincFilter, channels int, increment, startFilterInd
 	}
 }
 
+// --- TODO: Implement Processing & Helper Functions ---
+
+// sincMonoVariProcess handles mono data with potentially varying sample rate ratio.
+// Corresponds to sinc_mono_vari_process in src_sinc.c (Corrected version)
+func sincMonoVariProcess(state *srcState, data *SrcData) ErrorCode {
+	// ***** LOGGING START *****
+	if sincDebugEnabled {
+		fmt.Printf("\n[SINC_DEBUG] sincMonoVariProcess: ENTRY - data.InFrames=%d, data.OutFrames=%d, data.SrcRatio=%.5f, data.EOF=%t\n",
+			data.InputFrames, data.OutputFrames, data.SrcRatio, data.EndOfInput)
+		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: State - lastRatio=%.5f, lastPos=%.5f\n", state.lastRatio, state.lastPosition)
+	}
+	// ***** LOGGING END *****
+
+	filter, ok := state.privateData.(*sincFilter)
+	if !ok || filter == nil {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: ERROR: Invalid private data.\n") // LOGGING
+		}
+		return ErrBadState
+	}
+	if state.channels != 1 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: ERROR: Incorrect channel count (%d).\n", state.channels) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	inputIndex := state.lastPosition
+	srcRatio := state.lastRatio
+	var increment, startFilterIndex incrementT
+	var halfFilterChanLen, samplesInHand int
+	outCountSamples := data.OutputFrames * int64(state.channels)
+	data.InputFramesUsed = 0    // Reset before processing
+	data.OutputFramesGen = 0    // Reset before processing
+	var inUsedSamples int64 = 0 // Tracks samples consumed *by prepareData* cumulatively in this call
+	var outGenSamples int64 = 0 // Tracks samples generated *in this call*
+
+	// Initialize srcRatio if needed (first call)
+	if isBadSrcRatio(srcRatio) {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Initializing srcRatio from data.SrcRatio (%.5f)\n", data.SrcRatio) // LOGGING
+		}
+		if isBadSrcRatio(data.SrcRatio) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: ERROR: Bad initial srcRatio from data.\n") // LOGGING
+			}
+			return ErrBadSrcRatio
+		}
+		srcRatio = data.SrcRatio
+		// state.lastRatio = srcRatio // Don't update state.lastRatio yet, use local srcRatio for consistency check below
+	}
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Effective srcRatio for start = %.5f\n", srcRatio)
+	}
+
+	// Calculate required lookback/lookahead based on filter length and minimum ratio
+	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
+	if filter.indexInc <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: ERROR: Bad filter.indexInc (%d).\n", filter.indexInc) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	count := filterCoeffsLen / float64(filter.indexInc)
+	//minRatio := minFloat64(state.lastRatio, data.SrcRatio) // Use state.lastRatio here? C uses local src_ratio, which might be data->src_ratio initially. Let's use data->SrcRatio if state.lastRatio is invalid.
+	effectiveMinRatio := srcRatio        // Start with current effective ratio
+	if !isBadSrcRatio(state.lastRatio) { // If lastRatio was valid
+		effectiveMinRatio = minFloat64(state.lastRatio, srcRatio) // Consider variation
+	}
+	if effectiveMinRatio < (1.0 / srcMaxRatio) {
+		effectiveMinRatio = 1.0 / srcMaxRatio
+	}
+	if effectiveMinRatio < 1.0 && effectiveMinRatio > 1e-10 { // Avoid division by zero/very small
+		count /= effectiveMinRatio
+	} else if effectiveMinRatio <= 1e-10 {
+		// Handle extremely small ratio case - required lookback could be huge. Cap it?
+		// Let's just use a large multiplier for count to be safe, matching C's implicit large result.
+		count *= srcMaxRatio // Arbitrary large factor if ratio is near zero
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: WARNING: Very small minRatio (%.5f), using large lookback factor.\n", effectiveMinRatio) // LOGGING
+		}
+	}
+
+	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Calculated halfFilterChanLen = %d\n", halfFilterChanLen)
+	}
+
+	// Advance internal buffer pointer based on integer part of inputIndex
+	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
+	if filter.bLen <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: ERROR: Bad filter.bLen (%d).\n", filter.bLen) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	// Wrap bCurrent using modulo
+	newBCurrent := (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+	if newBCurrent < 0 { // Ensure positive result from modulo
+		newBCurrent += filter.bLen
+	}
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Advancing bCurrent by %d samples from %d to %d (modulo %d).\n", state.channels*intInputAdvance, filter.bCurrent, newBCurrent, filter.bLen)
+	}
+	filter.bCurrent = newBCurrent
+	inputIndex = fmodOne(inputIndex) // Keep only fractional part
+
+	// Main processing loop
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Starting main loop. Target output samples = %d\n", outCountSamples) // LOGGING
+	}
+	for outGenSamples < outCountSamples {
+		// ***** LOGGING *****
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Loop Iteration %d. outGenSamples=%d\n", outGenSamples, outGenSamples)
+		}
+
+		// Calculate samples currently available in the buffer
+		if filter.bEnd >= filter.bCurrent {
+			samplesInHand = filter.bEnd - filter.bCurrent
+		} else {
+			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+		}
+		// ***** LOGGING *****
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: samplesInHand=%d (bEnd=%d, bCurrent=%d, bLen=%d). Needed=%d\n", samplesInHand, filter.bEnd, filter.bCurrent, filter.bLen, halfFilterChanLen)
+		}
+
+		// Check if we need more data (including lookback/lookahead)
+		if samplesInHand <= halfFilterChanLen {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: samplesInHand <= halfFilterChanLen. Calling prepareData.\n") // LOGGING
+			}
+			// Need to update data.InputFramesUsed *before* calling prepareData if it was modified internally
+			data.InputFramesUsed = inUsedSamples / int64(state.channels)
+
+			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
+			if errCode != ErrNoError {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: prepareData returned error: %d\n", errCode) // LOGGING
+				}
+				state.errCode = errCode
+				return errCode // Propagate error
+			}
+			// Update local counter of used samples based on what prepareData consumed
+			inUsedSamples = data.InputFramesUsed * int64(state.channels)
+
+			// Recalculate samplesInHand after prepareData
+			if filter.bEnd >= filter.bCurrent {
+				samplesInHand = filter.bEnd - filter.bCurrent
+			} else {
+				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+			}
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: After prepareData: samplesInHand=%d, inUsedSamples=%d (data.InputFramesUsed=%d)\n", samplesInHand, inUsedSamples, data.InputFramesUsed) // LOGGING
+			}
+
+			// If still not enough samples after trying to prepare, we must break (EOF or insufficient buffer)
+			if samplesInHand <= halfFilterChanLen {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: samplesInHand *still* <= halfFilterChanLen (%d <= %d). Breaking loop.\n", samplesInHand, halfFilterChanLen) // LOGGING
+				}
+				break // Exit the loop
+			}
+		}
+
+		// Check for End Of Input condition within the buffer
+		// If bRealEnd is set (by prepareData padding) and we need data beyond it, stop.
+		//if filter.bRealEnd >= 0 {
+		//	// Calculate the furthest index needed for the current output sample calculation
+		//	maxIndexNeeded := filter.bCurrent + halfFilterChanLen // Approximate index needed
+		//	// Note: This check is approximate. The actual max index depends on startFilterIndex/increment.
+		//	// C code just checks `b_current + half_filter_chan_len`.
+		//	// A more accurate check might involve the dataIndex calculation within calcOutput*.
+		//	// Let's stick to the C check for now.
+		//	fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: EOF Check: bRealEnd=%d, maxIndexNeeded (approx)=%d\n", filter.bRealEnd, maxIndexNeeded) // LOGGING
+		//	if maxIndexNeeded >= filter.bRealEnd {
+		//		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: maxIndexNeeded >= bRealEnd. Breaking loop due to EOF.\n") // LOGGING
+		//		break                                                                                                   // Cannot calculate more output, reached end of real data + padding
+		//	}
+		//}
+		// *** EOF Check (Corrected to match C logic) ***
+		if filter.bRealEnd >= 0 {
+			// Calculate approximate position corresponding to the *next* output sample's center
+			// C uses 'terminate' which is approx 1.0 / src_ratio
+			// C checks: b_current + input_index (fractional) + terminate
+			// Need to use the *current* effective srcRatio for terminate calculation
+			terminate := 1.0/srcRatio + 1e-20                                  // Use current loop's srcRatio
+			checkPosition := float64(filter.bCurrent) + inputIndex + terminate // Approximate position needed for next sample
+
+			// C Check: if (checkPosition >= filter->b_real_end) break;
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] ... EOF Check: bRealEnd=%d, checkPosition(curr+idx+1/ratio)=%.2f\n", filter.bRealEnd, checkPosition) // LOGGING
+			}
+			if checkPosition >= float64(filter.bRealEnd) {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] ... Breaking loop due to EOF check (C logic).\n") // LOGGING
+				}
+				break // Break loop if EOF reached
+			}
+		}
+		// Vary ratio if needed (only if target output count > 0)
+		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
+			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
+			if isBadSrcRatio(srcRatio) {
+				// Clip ratio if it goes out of bounds during variation
+				if srcRatio < 1.0/srcMaxRatio {
+					srcRatio = 1.0 / srcMaxRatio
+				}
+				if srcRatio > srcMaxRatio {
+					srcRatio = srcMaxRatio
+				}
+			}
+			// ***** LOGGING *****
+			// fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Varied srcRatio to %.5f\n", srcRatio)
+		}
+
+		// Calculate fixed point increment based on potentially varying srcRatio
+		// C uses min (src_ratio, 1.0) - this ensures increment doesn't exceed indexInc when upsampling
+		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
+		increment = doubleToFP(floatIncrement)
+		if increment == 0 {
+			// This happens if srcRatio is extremely small, making floatIncrement effectively zero.
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: ERROR: Calculated increment is zero (srcRatio=%.15f, floatInc=%.15f).\n", srcRatio, floatIncrement) // LOGGING
+			}
+			// What should happen here? C returns error.
+			state.errCode = ErrBadSrcRatio // Or maybe ErrBadInternalState?
+			return state.errCode
+		}
+
+		// Calculate start index for filter coefficients based on fractional input position
+		// startFilterIndex = inputIndex * increment // This seems wrong, C uses inputIndex * floatIncrement
+		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
+
+		// Calculate scaling factor for output sample
+		// scaleFactor = increment / filter.indexInc ; C uses float_increment
+		scaleFactor := floatIncrement / float64(filter.indexInc)
+
+		// ***** LOGGING *****
+		// fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Calculating output: increment=%d, startFilterIndex=%d, scaleFactor=%.5f\n", increment, startFilterIndex, scaleFactor)
+
+		// Calculate the output sample
+		// ******** Potential Panic Point *********
+		// Ensure calcOutputSingle handles boundary conditions robustly
+		outputSample := scaleFactor * calcOutputSingle(filter, increment, startFilterIndex)
+		// ******** Potential Panic Point *********
+
+		// Store the output sample
+		outPos := int(outGenSamples)
+		if outPos >= len(data.DataOut) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: WARNING: Output buffer full (outPos=%d, len=%d). Breaking loop.\n", outPos, len(data.DataOut)) // LOGGING
+			}
+			// This indicates the provided output buffer was too small for the requested OutputFrames
+			state.errCode = ErrNoError // Not necessarily an error state, just can't write more
+			break                      // Exit the loop
+		}
+		data.DataOut[outPos] = float32(outputSample)
+		outGenSamples++
+
+		// ***** LOGGING *****
+		// fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Generated sample %d = %.5f\n", outGenSamples, outputSample)
+
+		// Update input index position for the next output sample
+		if srcRatio <= 1e-10 { // Avoid division by zero/very small
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: ERROR: srcRatio is zero or very small (%.15f), cannot advance input index.\n", srcRatio) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
+		}
+		inputIndex += 1.0 / srcRatio
+
+		// Advance internal buffer pointer based on integer part of new inputIndex
+		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
+		newBCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+		if newBCurrent < 0 {
+			newBCurrent += filter.bLen
+		}
+		// ***** LOGGING *****
+		// fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Advanced inputIndex to %.5f, intInputAdvance=%d, moving bCurrent from %d to %d.\n", inputIndex, intInputAdvance, filter.bCurrent, newBCurrent)
+		filter.bCurrent = newBCurrent
+		inputIndex = fmodOne(inputIndex) // Keep only fractional part
+	} // End main processing loop
+
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: Exited main loop.\n")
+	}
+
+	// Store final state
+	state.lastPosition = inputIndex
+	state.lastRatio = srcRatio // Store the potentially varied ratio used for the *last* sample
+	data.OutputFramesGen = outGenSamples / int64(state.channels)
+	// Ensure InputFramesUsed reflects *all* consumption triggered by prepareData calls
+	data.InputFramesUsed = inUsedSamples / int64(state.channels)
+
+	// ***** LOGGING *****
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMonoVariProcess: EXIT - data.OutGen=%d, data.InUsed=%d, state.lastPos=%.5f\n",
+			data.OutputFramesGen, data.InputFramesUsed, state.lastPosition)
+	}
+
+	// If no error occurred within the loop, return success
+	if state.errCode == ErrNoError {
+		return ErrNoError
+	}
+	// Otherwise, return the error code that was set
+	return state.errCode
+}
+
+// sincStereoVariProcess handles stereo data with potentially varying sample rate ratio.
+// Corresponds to sinc_stereo_vari_process in src_sinc.c
+func sincStereoVariProcess(state *srcState, data *SrcData) ErrorCode {
+	// ***** LOGGING START *****
+	fmt.Printf("\n[SINC_DEBUG] sincStereoVariProcess: ENTRY - data.InFrames=%d, data.OutFrames=%d, data.SrcRatio=%.5f, data.EOF=%t\n",
+		data.InputFrames, data.OutputFrames, data.SrcRatio, data.EndOfInput)
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: State - lastRatio=%.5f, lastPos=%.5f\n", state.lastRatio, state.lastPosition)
+	}
+	// ***** LOGGING END *****
+
+	filter, ok := state.privateData.(*sincFilter)
+	if !ok || filter == nil {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: ERROR: Invalid private data.\n") // LOGGING
+		}
+		return ErrBadState
+	}
+	if state.channels != 2 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: ERROR: Incorrect channel count (%d).\n", state.channels) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	inputIndex := state.lastPosition
+	srcRatio := state.lastRatio
+	var increment, startFilterIndex incrementT
+	var halfFilterChanLen, samplesInHand int
+	outCountSamples := data.OutputFrames * int64(state.channels) // Total samples to generate
+	data.InputFramesUsed = 0                                     // Reset before processing
+	data.OutputFramesGen = 0                                     // Reset before processing
+	var inUsedSamples int64 = 0                                  // Tracks samples consumed by prepareData
+	var outGenSamples int64 = 0                                  // Tracks samples generated
+
+	// Initialize srcRatio if needed
+	if isBadSrcRatio(srcRatio) {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Initializing srcRatio from data.SrcRatio (%.5f)\n", data.SrcRatio) // LOGGING
+		}
+		if isBadSrcRatio(data.SrcRatio) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: ERROR: Bad initial srcRatio from data.\n") // LOGGING
+			}
+			return ErrBadSrcRatio
+		}
+		srcRatio = data.SrcRatio
+		// state.lastRatio = srcRatio // Use local srcRatio for consistency check below
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Effective srcRatio for start = %.5f\n", srcRatio) // LOGGING
+	}
+
+	// Calculate required lookback/lookahead
+	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
+	if filter.indexInc <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: ERROR: Bad filter.indexInc (%d).\n", filter.indexInc) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	count := filterCoeffsLen / float64(filter.indexInc)
+	effectiveMinRatio := srcRatio
+	if !isBadSrcRatio(state.lastRatio) {
+		effectiveMinRatio = minFloat64(state.lastRatio, srcRatio)
+	}
+	if effectiveMinRatio < (1.0 / srcMaxRatio) {
+		effectiveMinRatio = 1.0 / srcMaxRatio
+	}
+	if effectiveMinRatio < 1.0 && effectiveMinRatio > 1e-10 {
+		count /= effectiveMinRatio
+	} else if effectiveMinRatio <= 1e-10 {
+		count *= srcMaxRatio
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: WARNING: Very small minRatio (%.5f), using large lookback factor.\n", effectiveMinRatio) // LOGGING
+		}
+	}
+	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Calculated halfFilterChanLen = %d\n", halfFilterChanLen) // LOGGING
+	}
+
+	// Advance internal buffer pointer
+	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
+	if filter.bLen <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: ERROR: Bad filter.bLen (%d).\n", filter.bLen) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	newBCurrent := (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+	if newBCurrent < 0 {
+		newBCurrent += filter.bLen
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Advancing bCurrent by %d samples from %d to %d (modulo %d).\n", state.channels*intInputAdvance, filter.bCurrent, newBCurrent, filter.bLen) // LOGGING
+	}
+	filter.bCurrent = newBCurrent
+	inputIndex = fmodOne(inputIndex)
+
+	// Main processing loop
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Starting main loop. Target output samples = %d\n", outCountSamples) // LOGGING
+	}
+	for outGenSamples < outCountSamples {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Loop Iteration %d. outGenSamples=%d\n", outGenSamples/int64(state.channels), outGenSamples) // LOGGING
+		}
+
+		// Calculate samples available
+		if filter.bEnd >= filter.bCurrent {
+			samplesInHand = filter.bEnd - filter.bCurrent
+		} else {
+			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+		}
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: samplesInHand=%d. Needed=%d\n", samplesInHand, halfFilterChanLen) // LOGGING
+		}
+
+		// Need more data?
+		if samplesInHand <= halfFilterChanLen {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: samplesInHand <= halfFilterChanLen. Calling prepareData.\n") // LOGGING
+			}
+			data.InputFramesUsed = inUsedSamples / int64(state.channels) // Update before call
+			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
+			if errCode != ErrNoError {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: prepareData returned error: %d\n", errCode) // LOGGING
+				}
+				state.errCode = errCode
+				return errCode
+			}
+			inUsedSamples = data.InputFramesUsed * int64(state.channels) // Update after call
+
+			// Recalculate samplesInHand
+			if filter.bEnd >= filter.bCurrent {
+				samplesInHand = filter.bEnd - filter.bCurrent
+			} else {
+				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+			}
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: After prepareData: samplesInHand=%d, inUsedSamples=%d (data.InputFramesUsed=%d)\n", samplesInHand, inUsedSamples, data.InputFramesUsed) // LOGGING
+			}
+
+			// Break if still not enough
+			if samplesInHand <= halfFilterChanLen {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: samplesInHand *still* <= halfFilterChanLen (%d <= %d). Breaking loop.\n", samplesInHand, halfFilterChanLen) // LOGGING
+				}
+				break
+			}
+		}
+
+		// Check EOF condition
+		// *** NEW Corrected EOF Check (Matches C logic) ***
+		if filter.bRealEnd >= 0 {
+			terminate := 1.0/srcRatio + 1e-20                                  // Use current loop's srcRatio
+			checkPosition := float64(filter.bCurrent) + inputIndex + terminate // Approximate position needed for next sample
+
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] ... EOF Check: bRealEnd=%d, checkPosition(curr+idx+1/ratio)=%.2f\n", filter.bRealEnd, checkPosition) // LOGGING
+			}
+			if checkPosition >= float64(filter.bRealEnd) {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] ... Breaking loop due to EOF check (C logic).\n") // LOGGING
+				}
+				break // Break loop if EOF reached
+			}
+		}
+		// Vary ratio if needed
+		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
+			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
+			if isBadSrcRatio(srcRatio) {
+				if srcRatio < 1.0/srcMaxRatio {
+					srcRatio = 1.0 / srcMaxRatio
+				}
+				if srcRatio > srcMaxRatio {
+					srcRatio = srcMaxRatio
+				}
+			}
+		}
+
+		// Calculate parameters for calcOutputStereo
+		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
+		increment = doubleToFP(floatIncrement)
+		if increment == 0 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: ERROR: Calculated increment is zero (srcRatio=%.15f, floatInc=%.15f).\n", srcRatio, floatIncrement) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
+		}
+		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
+		scaleFactor := floatIncrement / float64(filter.indexInc)
+
+		// Get output slice
+		outPos := int(outGenSamples)
+		if outPos+state.channels > len(data.DataOut) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: WARNING: Output buffer full (outPos=%d, channels=%d, len=%d). Breaking loop.\n", outPos, state.channels, len(data.DataOut)) // LOGGING
+			}
+			break
+		}
+		outputSlice := data.DataOut[outPos : outPos+state.channels]
+
+		// Calculate the output frame (stereo pair)
+		calcOutputStereo(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
+		outGenSamples += int64(state.channels) // Increment by number of channels
+
+		// fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Generated frame %d = [%.5f, %.5f]\n", outGenSamples/int64(state.channels), outputSlice[0], outputSlice[1]) // LOGGING
+
+		// Update input index
+		if srcRatio <= 1e-10 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: ERROR: srcRatio is zero or very small (%.15f), cannot advance input index.\n", srcRatio) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
+		}
+		inputIndex += 1.0 / srcRatio
+
+		// Advance buffer pointer
+		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
+		newBCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+		if newBCurrent < 0 {
+			newBCurrent += filter.bLen
+		}
+		// fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Advanced inputIndex to %.5f, intInputAdvance=%d, moving bCurrent from %d to %d.\n", inputIndex, intInputAdvance, filter.bCurrent, newBCurrent) // LOGGING
+		filter.bCurrent = newBCurrent
+		inputIndex = fmodOne(inputIndex)
+
+	} // End main processing loop
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: Exited main loop.\n") // LOGGING
+	}
+
+	// Store final state
+	state.lastPosition = inputIndex
+	state.lastRatio = srcRatio
+	data.OutputFramesGen = outGenSamples / int64(state.channels)
+	data.InputFramesUsed = inUsedSamples / int64(state.channels) // Ensure this reflects total consumed
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincStereoVariProcess: EXIT - data.OutGen=%d, data.InUsed=%d, state.lastPos=%.5f\n", data.OutputFramesGen, data.InputFramesUsed, state.lastPosition) // LOGGING
+	}
+
+	if state.errCode == ErrNoError {
+		return ErrNoError
+	}
+	return state.errCode
+}
+
+// sincQuadVariProcess handles quad audio data with potentially varying sample rate ratio.
+// Corresponds to sinc_quad_vari_process in src_sinc.c
+func sincQuadVariProcess(state *srcState, data *SrcData) ErrorCode {
+	// ***** LOGGING START *****
+	if sincDebugEnabled {
+		fmt.Printf("\n[SINC_DEBUG] sincQuadVariProcess: ENTRY - data.InFrames=%d, data.OutFrames=%d, data.SrcRatio=%.5f, data.EOF=%t\n",
+			data.InputFrames, data.OutputFrames, data.SrcRatio, data.EndOfInput)
+		fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: State - lastRatio=%.5f, lastPos=%.5f\n", state.lastRatio, state.lastPosition)
+	}
+	// ***** LOGGING END *****
+
+	filter, ok := state.privateData.(*sincFilter)
+	if !ok || filter == nil {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: ERROR: Invalid private data.\n") // LOGGING
+		}
+		return ErrBadState
+	}
+	if state.channels != 4 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: ERROR: Incorrect channel count (%d).\n", state.channels) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	inputIndex := state.lastPosition
+	srcRatio := state.lastRatio
+	var increment, startFilterIndex incrementT
+	var halfFilterChanLen, samplesInHand int
+	outCountSamples := data.OutputFrames * int64(state.channels)
+	data.InputFramesUsed = 0
+	data.OutputFramesGen = 0
+	var inUsedSamples int64 = 0
+	var outGenSamples int64 = 0
+
+	// Init ratio
+	if isBadSrcRatio(srcRatio) {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: Initializing srcRatio from data.SrcRatio (%.5f)\n", data.SrcRatio) // LOGGING
+		}
+		if isBadSrcRatio(data.SrcRatio) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: ERROR: Bad initial srcRatio from data.\n") // LOGGING
+			}
+			return ErrBadSrcRatio
+		}
+		srcRatio = data.SrcRatio
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: Effective srcRatio for start = %.5f\n", srcRatio) // LOGGING
+	}
+
+	// Calc lookback/ahead
+	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
+	if filter.indexInc <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: ERROR: Bad filter.indexInc (%d).\n", filter.indexInc) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	count := filterCoeffsLen / float64(filter.indexInc)
+	effectiveMinRatio := srcRatio
+	if !isBadSrcRatio(state.lastRatio) {
+		effectiveMinRatio = minFloat64(state.lastRatio, srcRatio)
+	}
+	if effectiveMinRatio < (1.0 / srcMaxRatio) {
+		effectiveMinRatio = 1.0 / srcMaxRatio
+	}
+	if effectiveMinRatio < 1.0 && effectiveMinRatio > 1e-10 {
+		count /= effectiveMinRatio
+	} else if effectiveMinRatio <= 1e-10 {
+		count *= srcMaxRatio
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: WARNING: Very small minRatio (%.5f), using large lookback factor.\n", effectiveMinRatio) // LOGGING
+		}
+	}
+	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: Calculated halfFilterChanLen = %d\n", halfFilterChanLen) // LOGGING
+	}
+
+	// Advance buffer ptr
+	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
+	if filter.bLen <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: ERROR: Bad filter.bLen (%d).\n", filter.bLen) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	newBCurrent := (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+	if newBCurrent < 0 {
+		newBCurrent += filter.bLen
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: Advancing bCurrent by %d samples from %d to %d (modulo %d).\n", state.channels*intInputAdvance, filter.bCurrent, newBCurrent, filter.bLen) // LOGGING
+	}
+	filter.bCurrent = newBCurrent
+	inputIndex = fmodOne(inputIndex)
+
+	// Main loop
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: Starting main loop. Target output samples = %d\n", outCountSamples) // LOGGING
+	}
+	for outGenSamples < outCountSamples {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: Loop Iteration %d. outGenSamples=%d\n", outGenSamples/int64(state.channels), outGenSamples) // LOGGING
+		}
+
+		// Samples available
+		if filter.bEnd >= filter.bCurrent {
+			samplesInHand = filter.bEnd - filter.bCurrent
+		} else {
+			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+		}
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: samplesInHand=%d. Needed=%d\n", samplesInHand, halfFilterChanLen) // LOGGING
+		}
+
+		// Need more?
+		if samplesInHand <= halfFilterChanLen {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: samplesInHand <= halfFilterChanLen. Calling prepareData.\n") // LOGGING
+			}
+			data.InputFramesUsed = inUsedSamples / int64(state.channels)
+			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
+			if errCode != ErrNoError {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: prepareData returned error: %d\n", errCode) // LOGGING
+				}
+				state.errCode = errCode
+				return errCode
+			}
+			inUsedSamples = data.InputFramesUsed * int64(state.channels)
+			if filter.bEnd >= filter.bCurrent {
+				samplesInHand = filter.bEnd - filter.bCurrent
+			} else {
+				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+			}
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: After prepareData: samplesInHand=%d, inUsedSamples=%d (data.InputFramesUsed=%d)\n", samplesInHand, inUsedSamples, data.InputFramesUsed) // LOGGING
+			}
+			if samplesInHand <= halfFilterChanLen {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: samplesInHand *still* <= halfFilterChanLen (%d <= %d). Breaking loop.\n", samplesInHand, halfFilterChanLen) // LOGGING
+				}
+				break
+			}
+		}
+
+		// Check EOF
+		// *** NEW Corrected EOF Check (Matches C logic) ***
+		if filter.bRealEnd >= 0 {
+			terminate := 1.0/srcRatio + 1e-20                                  // Use current loop's srcRatio
+			checkPosition := float64(filter.bCurrent) + inputIndex + terminate // Approximate position needed for next sample
+
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] ... EOF Check: bRealEnd=%d, checkPosition(curr+idx+1/ratio)=%.2f\n", filter.bRealEnd, checkPosition) // LOGGING
+			}
+			if checkPosition >= float64(filter.bRealEnd) {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] ... Breaking loop due to EOF check (C logic).\n") // LOGGING
+				}
+				break // Break loop if EOF reached
+			}
+		}
+		// Vary ratio
+		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
+			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
+			if isBadSrcRatio(srcRatio) {
+				if srcRatio < 1.0/srcMaxRatio {
+					srcRatio = 1.0 / srcMaxRatio
+				}
+				if srcRatio > srcMaxRatio {
+					srcRatio = srcMaxRatio
+				}
+			}
+		}
+
+		// Calc params
+		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
+		increment = doubleToFP(floatIncrement)
+		if increment == 0 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: ERROR: Calculated increment is zero (srcRatio=%.15f, floatInc=%.15f).\n", srcRatio, floatIncrement) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
+		}
+		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
+		scaleFactor := floatIncrement / float64(filter.indexInc)
+
+		// Get output slice
+		outPos := int(outGenSamples)
+		if outPos+state.channels > len(data.DataOut) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: WARNING: Output buffer full (outPos=%d, channels=%d, len=%d). Breaking loop.\n", outPos, state.channels, len(data.DataOut)) // LOGGING
+			}
+			break
+		}
+		outputSlice := data.DataOut[outPos : outPos+state.channels]
+
+		// Calc output frame
+		calcOutputQuad(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
+		outGenSamples += int64(state.channels)
+
+		// Update input index
+		if srcRatio <= 1e-10 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: ERROR: srcRatio is zero or very small (%.15f), cannot advance input index.\n", srcRatio) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
+		}
+		inputIndex += 1.0 / srcRatio
+
+		// Advance buffer pointer
+		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
+		newBCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+		if newBCurrent < 0 {
+			newBCurrent += filter.bLen
+		}
+		filter.bCurrent = newBCurrent
+		inputIndex = fmodOne(inputIndex)
+
+	} // End main loop
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: Exited main loop.\n") // LOGGING
+	}
+
+	// Store final state
+	state.lastPosition = inputIndex
+	state.lastRatio = srcRatio
+	data.OutputFramesGen = outGenSamples / int64(state.channels)
+	data.InputFramesUsed = inUsedSamples / int64(state.channels)
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincQuadVariProcess: EXIT - data.OutGen=%d, data.InUsed=%d, state.lastPos=%.5f\n", data.OutputFramesGen, data.InputFramesUsed, state.lastPosition) // LOGGING
+	}
+
+	if state.errCode == ErrNoError {
+		return ErrNoError
+	}
+	return state.errCode
+}
+
+// sincHexVariProcess handles 6-channel audio data with potentially varying sample rate ratio.
+// Corresponds to sinc_hex_vari_process in src_sinc.c
+func sincHexVariProcess(state *srcState, data *SrcData) ErrorCode {
+	// ***** LOGGING START *****
+	if sincDebugEnabled {
+		fmt.Printf("\n[SINC_DEBUG] sincHexVariProcess: ENTRY - data.InFrames=%d, data.OutFrames=%d, data.SrcRatio=%.5f, data.EOF=%t\n",
+			data.InputFrames, data.OutputFrames, data.SrcRatio, data.EndOfInput)
+		fmt.Printf("[SINC_DEBUG] sincHexVariProcess: State - lastRatio=%.5f, lastPos=%.5f\n", state.lastRatio, state.lastPosition)
+	}
+	// ***** LOGGING END *****
+
+	filter, ok := state.privateData.(*sincFilter)
+	if !ok || filter == nil {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: ERROR: Invalid private data.\n") // LOGGING
+		}
+		return ErrBadState
+	}
+	if state.channels != 6 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: ERROR: Incorrect channel count (%d).\n", state.channels) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	inputIndex := state.lastPosition
+	srcRatio := state.lastRatio
+	var increment, startFilterIndex incrementT
+	var halfFilterChanLen, samplesInHand int
+	outCountSamples := data.OutputFrames * int64(state.channels)
+	data.InputFramesUsed = 0
+	data.OutputFramesGen = 0
+	var inUsedSamples int64 = 0
+	var outGenSamples int64 = 0
+
+	// Init ratio
+	if isBadSrcRatio(srcRatio) {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: Initializing srcRatio from data.SrcRatio (%.5f)\n", data.SrcRatio) // LOGGING
+		}
+		if isBadSrcRatio(data.SrcRatio) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincHexVariProcess: ERROR: Bad initial srcRatio from data.\n") // LOGGING
+			}
+			return ErrBadSrcRatio
+		}
+		srcRatio = data.SrcRatio
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincHexVariProcess: Effective srcRatio for start = %.5f\n", srcRatio) // LOGGING
+	}
+
+	// Calc lookback/ahead
+	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
+	if filter.indexInc <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: ERROR: Bad filter.indexInc (%d).\n", filter.indexInc) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	count := filterCoeffsLen / float64(filter.indexInc)
+	effectiveMinRatio := srcRatio
+	if !isBadSrcRatio(state.lastRatio) {
+		effectiveMinRatio = minFloat64(state.lastRatio, srcRatio)
+	}
+	if effectiveMinRatio < (1.0 / srcMaxRatio) {
+		effectiveMinRatio = 1.0 / srcMaxRatio
+	}
+	if effectiveMinRatio < 1.0 && effectiveMinRatio > 1e-10 {
+		count /= effectiveMinRatio
+	} else if effectiveMinRatio <= 1e-10 {
+		count *= srcMaxRatio
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: WARNING: Very small minRatio (%.5f), using large lookback factor.\n", effectiveMinRatio) // LOGGING
+		}
+	}
+	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincHexVariProcess: Calculated halfFilterChanLen = %d\n", halfFilterChanLen) // LOGGING
+	}
+
+	// Advance buffer ptr
+	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
+	if filter.bLen <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: ERROR: Bad filter.bLen (%d).\n", filter.bLen) // LOGGING
+		}
+		return ErrBadInternalState
+	}
+	newBCurrent := (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+	if newBCurrent < 0 {
+		newBCurrent += filter.bLen
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincHexVariProcess: Advancing bCurrent by %d samples from %d to %d (modulo %d).\n", state.channels*intInputAdvance, filter.bCurrent, newBCurrent, filter.bLen) // LOGGING
+	}
+	filter.bCurrent = newBCurrent
+	inputIndex = fmodOne(inputIndex)
+
+	// Main loop
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincHexVariProcess: Starting main loop. Target output samples = %d\n", outCountSamples) // LOGGING
+	}
+	for outGenSamples < outCountSamples {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: Loop Iteration %d. outGenSamples=%d\n", outGenSamples/int64(state.channels), outGenSamples) // LOGGING
+		}
+
+		// Samples available
+		if filter.bEnd >= filter.bCurrent {
+			samplesInHand = filter.bEnd - filter.bCurrent
+		} else {
+			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+		}
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincHexVariProcess: samplesInHand=%d. Needed=%d\n", samplesInHand, halfFilterChanLen) // LOGGING
+		}
+
+		// Need more?
+		if samplesInHand <= halfFilterChanLen {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincHexVariProcess: samplesInHand <= halfFilterChanLen. Calling prepareData.\n") // LOGGING
+			}
+			data.InputFramesUsed = inUsedSamples / int64(state.channels)
+			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
+			if errCode != ErrNoError {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincHexVariProcess: prepareData returned error: %d\n", errCode) // LOGGING
+				}
+				state.errCode = errCode
+				return errCode
+			}
+			inUsedSamples = data.InputFramesUsed * int64(state.channels)
+			if filter.bEnd >= filter.bCurrent {
+				samplesInHand = filter.bEnd - filter.bCurrent
+			} else {
+				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
+			}
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincHexVariProcess: After prepareData: samplesInHand=%d, inUsedSamples=%d (data.InputFramesUsed=%d)\n", samplesInHand, inUsedSamples, data.InputFramesUsed) // LOGGING
+			}
+			if samplesInHand <= halfFilterChanLen {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincHexVariProcess: samplesInHand *still* <= halfFilterChanLen (%d <= %d). Breaking loop.\n", samplesInHand, halfFilterChanLen) // LOGGING
+				}
+				break
+			}
+		}
+
+		// Check EOF
+		// *** NEW Corrected EOF Check (Matches C logic) ***
+		if filter.bRealEnd >= 0 {
+			terminate := 1.0/srcRatio + 1e-20                                  // Use current loop's srcRatio
+			checkPosition := float64(filter.bCurrent) + inputIndex + terminate // Approximate position needed for next sample
+
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] ... EOF Check: bRealEnd=%d, checkPosition(curr+idx+1/ratio)=%.2f\n", filter.bRealEnd, checkPosition) // LOGGING
+			}
+			if checkPosition >= float64(filter.bRealEnd) {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] ... Breaking loop due to EOF check (C logic).\n") // LOGGING
+				}
+				break // Break loop if EOF reached
+			}
+		}
+		// Vary ratio
+		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
+			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
+			if isBadSrcRatio(srcRatio) {
+				if srcRatio < 1.0/srcMaxRatio {
+					srcRatio = 1.0 / srcMaxRatio
+				}
+				if srcRatio > srcMaxRatio {
+					srcRatio = srcMaxRatio
+				}
+			}
+		}
+
+		// Calc params
+		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
+		increment = doubleToFP(floatIncrement)
+		if increment == 0 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincHexVariProcess: ERROR: Calculated increment is zero (srcRatio=%.15f, floatInc=%.15f).\n", srcRatio, floatIncrement) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
+		}
+		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
+		scaleFactor := floatIncrement / float64(filter.indexInc)
+
+		// Get output slice
+		outPos := int(outGenSamples)
+		if outPos+state.channels > len(data.DataOut) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincHexVariProcess: WARNING: Output buffer full (outPos=%d, channels=%d, len=%d). Breaking loop.\n", outPos, state.channels, len(data.DataOut)) // LOGGING
+			}
+			break
+		}
+		outputSlice := data.DataOut[outPos : outPos+state.channels]
+
+		// Calc output frame
+		calcOutputHex(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
+		outGenSamples += int64(state.channels)
+
+		// Update input index
+		if srcRatio <= 1e-10 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincHexVariProcess: ERROR: srcRatio is zero or very small (%.15f), cannot advance input index.\n", srcRatio) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
+		}
+		inputIndex += 1.0 / srcRatio
+
+		// Advance buffer pointer
+		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
+		newBCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+		if newBCurrent < 0 {
+			newBCurrent += filter.bLen
+		}
+		filter.bCurrent = newBCurrent
+		inputIndex = fmodOne(inputIndex)
+
+	} // End main loop
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincHexVariProcess: Exited main loop.\n") // LOGGING
+	}
+
+	// Store final state
+	state.lastPosition = inputIndex
+	state.lastRatio = srcRatio
+	data.OutputFramesGen = outGenSamples / int64(state.channels)
+	data.InputFramesUsed = inUsedSamples / int64(state.channels)
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincHexVariProcess: EXIT - data.OutGen=%d, data.InUsed=%d, state.lastPos=%.5f\n", data.OutputFramesGen, data.InputFramesUsed, state.lastPosition) // LOGGING
+	}
+
+	if state.errCode == ErrNoError {
+		return ErrNoError
+	}
+	return state.errCode
+}
+
 // sincMultichanVariProcess handles generic multi-channel audio data.
 // Corresponds to sinc_multichan_vari_process in src_sinc.c
 func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
+	// ***** LOGGING START *****
+	if sincDebugEnabled {
+		fmt.Printf("\n[SINC_DEBUG] sincMultichanVariProcess: ENTRY - data.InFrames=%d, data.OutFrames=%d, data.SrcRatio=%.5f, data.EOF=%t\n",
+			data.InputFrames, data.OutputFrames, data.SrcRatio, data.EndOfInput)
+		fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: State - chans=%d, lastRatio=%.5f, lastPos=%.5f\n", state.channels, state.lastRatio, state.lastPosition)
+	}
+	// ***** LOGGING END *****
+
 	filter, ok := state.privateData.(*sincFilter)
 	if !ok || filter == nil {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: ERROR: Invalid private data.\n") // LOGGING
+		}
 		return ErrBadState
 	}
 	// No specific channel check here
@@ -1687,42 +2411,101 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 	data.OutputFramesGen = 0
 	var inUsedSamples int64 = 0
 	var outGenSamples int64 = 0
+
+	// Init ratio
 	if isBadSrcRatio(srcRatio) {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: Initializing srcRatio from data.SrcRatio (%.5f)\n", data.SrcRatio) // LOGGING
+		}
 		if isBadSrcRatio(data.SrcRatio) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: ERROR: Bad initial srcRatio from data.\n") // LOGGING
+			}
 			return ErrBadSrcRatio
 		}
 		srcRatio = data.SrcRatio
-		state.lastRatio = srcRatio
 	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: Effective srcRatio for start = %.5f\n", srcRatio) // LOGGING
+	}
+
+	// Calc lookback/ahead
 	filterCoeffsLen := float64(filter.coeffHalfLen + 2)
 	if filter.indexInc <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: ERROR: Bad filter.indexInc (%d).\n", filter.indexInc) // LOGGING
+		}
 		return ErrBadInternalState
 	}
 	count := filterCoeffsLen / float64(filter.indexInc)
-	minRatio := minFloat64(state.lastRatio, data.SrcRatio)
-	if minRatio < (1.0 / srcMaxRatio) {
-		minRatio = 1.0 / srcMaxRatio
+	effectiveMinRatio := srcRatio
+	if !isBadSrcRatio(state.lastRatio) {
+		effectiveMinRatio = minFloat64(state.lastRatio, srcRatio)
 	}
-	if minRatio < 1.0 && minRatio != 0 {
-		count /= minRatio
+	if effectiveMinRatio < (1.0 / srcMaxRatio) {
+		effectiveMinRatio = 1.0 / srcMaxRatio
+	}
+	if effectiveMinRatio < 1.0 && effectiveMinRatio > 1e-10 {
+		count /= effectiveMinRatio
+	} else if effectiveMinRatio <= 1e-10 {
+		count *= srcMaxRatio
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: WARNING: Very small minRatio (%.5f), using large lookback factor.\n", effectiveMinRatio) // LOGGING
+		}
 	}
 	halfFilterChanLen = state.channels * (psfLrint(count) + 1)
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: Calculated halfFilterChanLen = %d\n", halfFilterChanLen) // LOGGING
+	}
+
+	// Advance buffer ptr
 	intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
 	if filter.bLen <= 0 {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: ERROR: Bad filter.bLen (%d).\n", filter.bLen) // LOGGING
+		}
 		return ErrBadInternalState
 	}
-	filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+	newBCurrent := (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+	if newBCurrent < 0 {
+		newBCurrent += filter.bLen
+	}
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: Advancing bCurrent by %d samples from %d to %d (modulo %d).\n", state.channels*intInputAdvance, filter.bCurrent, newBCurrent, filter.bLen) // LOGGING
+	}
+	filter.bCurrent = newBCurrent
 	inputIndex = fmodOne(inputIndex)
+
+	// Main loop
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: Starting main loop. Target output samples = %d\n", outCountSamples) // LOGGING
+	}
 	for outGenSamples < outCountSamples {
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: Loop Iteration %d. outGenSamples=%d\n", outGenSamples/int64(state.channels), outGenSamples) // LOGGING
+		}
+
+		// Samples available
 		if filter.bEnd >= filter.bCurrent {
 			samplesInHand = filter.bEnd - filter.bCurrent
 		} else {
 			samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 		}
+		if sincDebugEnabled {
+			fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: samplesInHand=%d. Needed=%d\n", samplesInHand, halfFilterChanLen) // LOGGING
+		}
+
+		// Need more?
 		if samplesInHand <= halfFilterChanLen {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: samplesInHand <= halfFilterChanLen. Calling prepareData.\n") // LOGGING
+			}
 			data.InputFramesUsed = inUsedSamples / int64(state.channels)
 			errCode := prepareData(filter, state.channels, data, halfFilterChanLen)
 			if errCode != ErrNoError {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: prepareData returned error: %d\n", errCode) // LOGGING
+				}
 				state.errCode = errCode
 				return errCode
 			}
@@ -1732,16 +2515,35 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 			} else {
 				samplesInHand = (filter.bEnd + filter.bLen) - filter.bCurrent
 			}
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: After prepareData: samplesInHand=%d, inUsedSamples=%d (data.InputFramesUsed=%d)\n", samplesInHand, inUsedSamples, data.InputFramesUsed) // LOGGING
+			}
 			if samplesInHand <= halfFilterChanLen {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: samplesInHand *still* <= halfFilterChanLen (%d <= %d). Breaking loop.\n", samplesInHand, halfFilterChanLen) // LOGGING
+				}
 				break
 			}
 		}
+
+		// Check EOF
+		// *** NEW Corrected EOF Check (Matches C logic) ***
 		if filter.bRealEnd >= 0 {
-			maxIndexNeeded := filter.bCurrent + halfFilterChanLen
-			if maxIndexNeeded >= filter.bRealEnd {
-				break
+			terminate := 1.0/srcRatio + 1e-20                                  // Use current loop's srcRatio
+			checkPosition := float64(filter.bCurrent) + inputIndex + terminate // Approximate position needed for next sample
+
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] ... EOF Check: bRealEnd=%d, checkPosition(curr+idx+1/ratio)=%.2f\n", filter.bRealEnd, checkPosition) // LOGGING
+			}
+			if checkPosition >= float64(filter.bRealEnd) {
+				if sincDebugEnabled {
+					fmt.Printf("[SINC_DEBUG] ... Breaking loop due to EOF check (C logic).\n") // LOGGING
+				}
+				break // Break loop if EOF reached
 			}
 		}
+
+		// Vary ratio
 		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
 			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)
 			if isBadSrcRatio(srcRatio) {
@@ -1753,37 +2555,154 @@ func sincMultichanVariProcess(state *srcState, data *SrcData) ErrorCode {
 				}
 			}
 		}
+
+		// Calc params
 		floatIncrement := float64(filter.indexInc) * minFloat64(srcRatio, 1.0)
 		increment = doubleToFP(floatIncrement)
 		if increment == 0 {
-			return ErrBadSrcRatio
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: ERROR: Calculated increment is zero (srcRatio=%.15f, floatInc=%.15f).\n", srcRatio, floatIncrement) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
 		}
 		startFilterIndex = doubleToFP(inputIndex * floatIncrement)
 		scaleFactor := floatIncrement / float64(filter.indexInc)
+
+		// Get output slice
 		outPos := int(outGenSamples)
 		if outPos+state.channels > len(data.DataOut) {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: WARNING: Output buffer full (outPos=%d, channels=%d, len=%d). Breaking loop.\n", outPos, state.channels, len(data.DataOut)) // LOGGING
+			}
 			break
 		}
 		outputSlice := data.DataOut[outPos : outPos+state.channels]
+
 		// *** Call calcOutputMulti ***
 		calcOutputMulti(filter, state.channels, increment, startFilterIndex, scaleFactor, outputSlice)
 		outGenSamples += int64(state.channels)
-		if srcRatio == 0 {
-			return ErrBadSrcRatio
+
+		// Update input index
+		if srcRatio <= 1e-10 {
+			if sincDebugEnabled {
+				fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: ERROR: srcRatio is zero or very small (%.15f), cannot advance input index.\n", srcRatio) // LOGGING
+			}
+			state.errCode = ErrBadSrcRatio
+			return state.errCode
 		}
 		inputIndex += 1.0 / srcRatio
+
+		// Advance buffer pointer
 		intInputAdvance = psfLrint(inputIndex - fmodOne(inputIndex))
-		filter.bCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+		newBCurrent = (filter.bCurrent + state.channels*intInputAdvance) % filter.bLen
+		if newBCurrent < 0 {
+			newBCurrent += filter.bLen
+		}
+		filter.bCurrent = newBCurrent
 		inputIndex = fmodOne(inputIndex)
+
+	} // End main loop
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: Exited main loop.\n") // LOGGING
 	}
+
+	// Store final state
 	state.lastPosition = inputIndex
 	state.lastRatio = srcRatio
 	data.OutputFramesGen = outGenSamples / int64(state.channels)
-	data.InputFramesUsed = inUsedSamples / int64(state.channels)
-	return ErrNoError
+	data.InputFramesUsed = inUsedSamples / int64(state.channels) // Ensure this reflects total consumed
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincMultichanVariProcess: EXIT - data.OutGen=%d, data.InUsed=%d, state.lastPos=%.5f\n", data.OutputFramesGen, data.InputFramesUsed, state.lastPosition) // LOGGING
+	}
+
+	if state.errCode == ErrNoError {
+		return ErrNoError
+	}
+	return state.errCode
 }
 
 // --- End of Sinc Processing Functions ---
 
 // Translate src_linear.c and src_zoh.c if those converters are desired.
 // Ensure the main dispatcher psrcSetConverter correctly calls the constructors for all implemented types (newSincState, newLinearState, newZohState).
+
+// Helper function (assuming definition exists elsewhere)
+// fmodOne returns the fractional part of a float64, ensuring it's in [0.0, 1.0)
+//func fmodOne(x float64) float64 {
+//	_, frac := math.Modf(x)
+//	if frac < 0.0 {
+//		frac += 1.0
+//	}
+//	return frac
+//}
+
+// Helper function (assuming definition exists elsewhere)
+// minFloat64 returns the smaller of two float64 values.
+//func minFloat64(a, b float64) float64 {
+//	if a < b {
+//		return a
+//	}
+//	return b
+//}
+
+// Helper function (assuming definition exists elsewhere)
+// minInt returns the smaller of two int values.
+//func minInt(a, b int) int {
+//	if a < b {
+//		return a
+//	}
+//	return b
+//}
+
+// Helper function (assuming definition exists elsewhere)
+// maxInt returns the larger of two int values.
+//func maxInt(a, b int) int {
+//	if a > b {
+//		return a
+//	}
+//	return b
+//}
+
+// Helper function (assuming definition exists elsewhere)
+// psfLrint rounds a float64 to the nearest integer (long equivalent), rounding half away from zero.
+//func psfLrint(x float64) int {
+//	if x >= 0.0 {
+//		return int(math.Floor(x + 0.5))
+//	}
+//	return int(math.Ceil(x - 0.5))
+//}
+
+// Helper function (assuming definition exists elsewhere)
+// psfLrintf rounds a float32 to the nearest integer (int equivalent), rounding half away from zero.
+//func psfLrintf(x float32) int {
+//	if x >= 0.0 {
+//		// Use float64 intermediate for precision in calculation? No, match C lrintf.
+//		return int(math.Floor(float64(x) + 0.5))
+//	}
+//	return int(math.Ceil(float64(x) - 0.5))
+//}
+
+// Helper type from coeffs.go (ensure this matches)
+//type coeffData struct {
+//	Name      string
+//	Desc      string
+//	Coeffs    []float32
+//	Increment int
+//}
+//
+//// Placeholder for actual coefficient data (ensure these exist in coeffs.go or similar)
+//var fastestCoeffs coeffData
+//var midQualCoeffs coeffData
+//var highQualCoeffs coeffData
+//
+//// Placeholder for global enabled flags (ensure these exist and match build config)
+//const enableSincFastConverter = true
+//const enableSincMediumConverter = true
+//const enableSincBestConverter = true
+//
+//// Placeholder constants (ensure these match definitions)
+//const srcMaxRatio = 256.0
+//const srcMinRatioDiff = 1e-20 // or appropriate small value
