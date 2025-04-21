@@ -1,15 +1,16 @@
 package libsamplerate
 
-// --- Coefficient Data Initialization ---
-// IMPORTANT: Replace the empty slices and zero increments
-// with the actual data copied from the C .h files.
+// Use GNU Octave to run make_filter. See original C libsamplerate
+// f = make_filter (8, 128, 100.3) ;
+// Pass band width  : 0.0039062 (should be 0.0039062)
+// Stop band atten. : 100.71 dB
+// -3dB band width  : 0.484
+// half length      : 2463
+// increment        : 128
 
 var fastestCoeffs = coeffData{
 	Increment: 128, // From fastest_coeffs.h
 	Coeffs: []float32{
-		// PASTE THE 2464 FLOATS FROM fastest_coeffs.h HERE
-		// Example start: 8.31472372954840555082e-01, 8.31414005540308198583e-01, ...
-		// Example end: ..., 0.0,
 		8.31472372954840555082e-01,
 		8.31414005540308198583e-01,
 		8.31238918266223869580e-01,

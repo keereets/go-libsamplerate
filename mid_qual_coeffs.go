@@ -1,12 +1,18 @@
 package libsamplerate
 
+//
+// f = make_src_filter (cycles = 21, incr = 491, atten = 122.000000)
+//
+//   Stop band atten. : 120.61 dB
+//   -3dB band width  : 1.811
+//   half length      : 22437
+//   increment        : 491
+///
+
 // Added midQualCoeffs
 var midQualCoeffs = coeffData{
 	Increment: 491, // From mid_qual_coeffs.h
 	Coeffs: []float32{
-		// PASTE THE 22438 FLOATS FROM mid_qual_coeffs.h HERE
-		// Example start: 9.190632349861385109e-01, 9.190579273831620544e-01, ...
-		// Example end: ..., 0.0,
 		9.190632349861385109e-01,
 		9.190579273831620544e-01,
 		9.190420046848706281e-01,
