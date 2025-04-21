@@ -267,3 +267,14 @@ func absInt16(x int16) int16 {
 	}
 	return x
 }
+
+// reverseDataGo reverses the elements of a float32 slice in place.
+func reverseDataGo(data []float32) {
+	left := 0
+	right := len(data) - 1
+	for left < right {
+		data[left], data[right] = data[right], data[left]
+		left++
+		right--
+	}
+}
