@@ -69,6 +69,21 @@ func newLinearState(channels int) (*srcState, ErrorCode) {
 
 // linearReset resets the linear converter's private state.
 func linearReset(state *srcState) {
+	// ... (get filter, check ok) ...
+	filter, ok := state.privateData.(*linearFilter)
+	if !ok || filter == nil { /* handle error */
+		return
+	}
+
+	// Reset state (actual reset logic)
+	filter.dirty = false
+	for i := range filter.lastValue {
+		filter.lastValue[i] = 0.0
+	}
+}
+
+// linearResetX resets the linear converter's private state.
+func linearResetX(state *srcState) {
 	if state == nil || state.privateData == nil {
 		return
 	}
@@ -221,15 +236,30 @@ func linearVariProcess(state *srcState, data *SrcData) ErrorCode {
 	inUsedSamples += initialFramesSkipped * int64(channels)
 	inputIndex = fmodOne(inputIndex)
 
+	// --- Main Processing Loop ---
+	// C: while (priv->out_gen < priv->out_count && priv->in_used + state->channels * input_index < priv->in_count)
 	for outGenSamples < outCountSamples {
-		y1BaseIndex := inUsedSamples
+		// Check C condition: is projected read position within input buffer?
+		// projectedReadPos is roughly inUsedSamples + int(inputIndex * channels) but needs care with float precision
+		// Let's calculate the indices needed explicitly first.
+		y1BaseIndex := inUsedSamples                 // Start of frame k+1
+		y0BaseIndex := y1BaseIndex - int64(channels) // Start of frame k
+
+		// Check if the *next* sample potentially needed (y1) is beyond the input count
 		if y1BaseIndex+int64(channels) > inCountSamples {
-			break
+			break // Cannot guarantee y1 exists for interpolation
 		}
-		if y1BaseIndex < int64(channels) {
-			break
-		} // Should be handled by first loop
-		y0BaseIndex := y1BaseIndex - int64(channels)
+		// Check if the *current* previous sample (y0) index is valid
+		if y0BaseIndex < 0 {
+			break // Cannot interpolate before the first known frame (should be handled by first loop)
+		}
+
+		// Re-implementing C check slightly differently but with same goal: ensure y0 and y1 are validly within inCountSamples
+		// If we pass these checks, we can proceed.
+
+		// Original C check using fractional index:
+		// project_in_samples := float64(inUsedSamples) + inputIndex*float64(channels)
+		// if project_in_samples >= float64(inCountSamples) { break; }
 
 		if outCountSamples > 0 && math.Abs(state.lastRatio-data.SrcRatio) > srcMinRatioDiff {
 			srcRatio = state.lastRatio + float64(outGenSamples)*(data.SrcRatio-state.lastRatio)/float64(outCountSamples)

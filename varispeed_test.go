@@ -198,8 +198,8 @@ func testVarispeed(t *testing.T, converter ConverterType, targetSnr float64) {
 
 	// --- Calculate SNR of final output ---
 	// State is closed automatically by defer
-	finalOutput := output[:outputLenPass2]        // Slice to actual output
-	snr, snrErr := calculateSnrGo(finalOutput, 1) // Use function from snr_bw_test / test_utils
+	finalOutput := output[:outputLenPass2]               // Slice to actual output
+	snr, snrErr := calculateSnrGo(finalOutput, 1, false) // Use function from snr_bw_test / test_utils
 
 	if snrErr != nil {
 		t.Errorf("%s calculateSnrGo failed: %v (C Line ~174)", logPrefix, snrErr)

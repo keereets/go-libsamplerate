@@ -9,6 +9,7 @@ package libsamplerate
 import (
 	"fmt"
 	"math"
+	"strings"
 	"testing"
 	// Assumes types, constants, New, Process, etc. are defined
 	// Assumes helpers genWindowedSinesGo, calculateSnrGo are in test_utils.go
@@ -48,6 +49,7 @@ var evaluationSnrTestData = []evaluationSnrTestParams{
 // using test conditions derived from src-evaluate.c's measure_snr function.
 // It logs the measured SNR but doesn't compare against external program results.
 func TestEvaluateQualityAPI(t *testing.T) {
+	//verbose := testing.Verbose()
 	convertersToTest := []struct {
 		name      string
 		converter ConverterType
@@ -76,9 +78,37 @@ func TestEvaluateQualityAPI(t *testing.T) {
 
 			for i, params := range evaluationSnrTestData {
 				testParams := params // Capture
-				testName := fmt.Sprintf("Test_%d_%s_OutSR_%d", i, testParams.testDesc, testParams.outputSampleRate)
+				// Create a sanitized description for the name
+				sanitizedDesc := strings.ReplaceAll(testParams.testDesc, " ", "_")
+				// Generate the test name using the sanitized description
+				testName := fmt.Sprintf("Test_%d_%s_OutSR_%d", i, sanitizedDesc, testParams.outputSampleRate)
 
 				t.Run(testName, func(t *testing.T) {
+					enableDetailedSnrLog := false
+					if converterTest.converter == Linear && i == 3 { // Check for specific converter and index
+						enableDetailedSnrLog = true
+						fmt.Printf("\n####### Enabling Detailed SNR Log for %s #######\n", testName) // Add marker
+					}
+					//switch converterTest.converter {
+					//case ZeroOrderHold:
+					//	if i == 3 {
+					//		enableDetailedSnrLog = true
+					//	}
+					//case Linear:
+					//	if i == 3 || i == 5 || i == 7 {
+					//		enableDetailedSnrLog = true
+					//	}
+					//case SincMediumQuality:
+					//	if i == 3 || i == 4 {
+					//		enableDetailedSnrLog = true
+					//	}
+					//case SincBestQuality:
+					//	if i == 3 {
+					//		enableDetailedSnrLog = true
+					//	}
+					//}
+					runEvaluationSnrTest(t, converterTest.converter, &testParams, enableDetailedSnrLog)
+
 					// Generate input signal (fixed 44.1kHz rate)
 					genWindowedSinesGo(testParams.freqCount, testParams.freqs[:testParams.freqCount], 0.9, inputBuffer) // Amp 0.9 matches C
 
@@ -124,7 +154,7 @@ func TestEvaluateQualityAPI(t *testing.T) {
 					}
 
 					// --- Measure SNR ---
-					snr, snrErr := calculateSnrGo(outputBuffer[:actualOutputLen], testParams.passBandPeaks)
+					snr, snrErr := calculateSnrGo(outputBuffer[:actualOutputLen], testParams.passBandPeaks, enableDetailedSnrLog)
 
 					logPrefix := fmt.Sprintf("Ratio %.4f (SR %d->%d): ", srcRatio, int(evaluateInputRate), testParams.outputSampleRate)
 					if snrErr != nil {
@@ -145,4 +175,80 @@ func TestEvaluateQualityAPI(t *testing.T) {
 			} // End loop over test params
 		}) // End t.Run for converter type
 	} // End loop over converters
+}
+
+// runEvaluationSnrTest performs SRC and calculates SNR for evaluation purposes, logging the result.
+func runEvaluationSnrTest(t *testing.T, converter ConverterType, testParams *evaluationSnrTestParams, verbose bool) {
+	t.Helper()
+
+	logPrefix := fmt.Sprintf("Eval %s (Ratio %.4f): ", testParams.testDesc, float64(testParams.outputSampleRate)/evaluateInputRate) // Use testDesc
+	if verbose {
+		t.Logf("%s Starting", logPrefix)
+		// Log freqs etc. if needed
+	}
+
+	inputBuffer := make([]float32, evaluateBufferLen)
+	genWindowedSinesGo(testParams.freqCount, testParams.freqs[:testParams.freqCount], 0.9, inputBuffer) // Amp 0.9
+
+	srcRatio := float64(testParams.outputSampleRate) / evaluateInputRate
+	if isBadSrcRatio(srcRatio) {
+		t.Skipf("%s Bad SRC Ratio %.5f", logPrefix, srcRatio)
+		return
+	}
+	outputFramesEstimate := int64(math.Ceil(float64(len(inputBuffer))*srcRatio)) + 100
+	outputBuffer := make([]float32, outputFramesEstimate)
+
+	state, err := New(converter, 1)
+	if err != nil {
+		t.Fatalf("%s New() failed: %v", logPrefix, err)
+	}
+	defer state.Close()
+
+	srcData := SrcData{
+		DataIn: inputBuffer, InputFrames: int64(len(inputBuffer)),
+		DataOut: outputBuffer, OutputFrames: int64(len(outputBuffer)),
+		SrcRatio: srcRatio, EndOfInput: true,
+	}
+
+	err = state.Process(&srcData)
+	if err != nil {
+		t.Fatalf("%s Process() failed: %v", logPrefix, err)
+	}
+
+	actualOutputLen := int(srcData.OutputFramesGen)
+	if actualOutputLen <= 0 {
+		t.Fatalf("%s Process() generated no output", logPrefix)
+	}
+	if actualOutputLen > len(outputBuffer) {
+		t.Fatalf("%s Process() generated more output (%d) than buffer capacity (%d)", logPrefix, actualOutputLen, len(outputBuffer))
+	}
+
+	// Truncate if needed for calculateSnrGo's internal limits
+	validOutputForAnalysis := outputBuffer[:actualOutputLen]
+	if len(validOutputForAnalysis) > maxSpecLen { // Use maxSpecLen constant
+		t.Logf("%s WARNING: Truncating output for SNR analysis from %d to %d samples", logPrefix, len(validOutputForAnalysis), maxSpecLen)
+		validOutputForAnalysis = validOutputForAnalysis[:maxSpecLen]
+	}
+	if len(validOutputForAnalysis) == 0 {
+		t.Fatalf("%s No valid output data for SNR analysis after truncation", logPrefix)
+	}
+
+	// --- Measure SNR ---
+	// Pass enableLog=verbose to see details if needed
+	snr, snrErr := calculateSnrGo(validOutputForAnalysis, testParams.passBandPeaks, verbose)
+
+	if snrErr != nil {
+		// Report error from calculation, but don't compare SNR value
+		t.Errorf("%s SNR Calculation Failed: %v", logPrefix, snrErr)
+	} else {
+		// Log the measured value
+		t.Logf("%s Measured SNR = %.2f dB", logPrefix, snr)
+	}
+
+	// Check input consumed
+	if srcData.InputFramesUsed != int64(len(inputBuffer)) {
+		t.Errorf("%s Did not consume all input: Used %d, Expected %d", logPrefix, srcData.InputFramesUsed, len(inputBuffer))
+	}
+
+	// No t.Failed() check needed, as we aren't asserting SNR levels here. Pass/Fail determined by errors/fatals above.
 }

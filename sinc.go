@@ -222,6 +222,58 @@ func newSincState(converterType ConverterType, channels int) (*srcState, ErrorCo
 
 // sincReset resets the internal state of the Sinc filter.
 func sincReset(state *srcState) {
+	filter, ok := state.privateData.(*sincFilter)
+	if !ok || filter == nil { /* handle error */
+		return
+	}
+
+	if sincDebugEnabled {
+		fmt.Printf("[SINC_DEBUG] sincReset: Resetting filter state.\n")
+	}
+
+	// Reset buffer pointers and state
+	filter.bCurrent = 0
+	filter.bEnd = 0
+	filter.bRealEnd = -1
+
+	// Don't reset state.lastRatio/lastPosition here, C src_reset handles common fields
+
+	// Zero out the main part of the buffer
+	if filter.bLen > 0 && len(filter.buffer) > 0 {
+		zeroLen := minInt(filter.bLen, len(filter.buffer)) // Ensure bounds
+		bufferToZero := filter.buffer[:zeroLen]
+		for i := range bufferToZero {
+			bufferToZero[i] = 0.0
+		}
+	}
+
+	// Set the sanity check area after the main buffer data
+	sanityCheckValue := float32(170.0) // 0xAA
+	start := filter.bLen
+	count := state.channels
+	end := start + count
+
+	for i := range filter.leftCalc {
+		filter.leftCalc[i] = 0.0
+		filter.rightCalc[i] = 0.0 // Assuming rightCalc has same size based on maxChannels
+	}
+
+	if len(filter.buffer) > 0 && count > 0 && start >= 0 {
+		if end > len(filter.buffer) {
+			end = len(filter.buffer) // Clip to actual buffer size
+		}
+		if end > start {
+			sanitySlice := filter.buffer[start:end]
+			for i := range sanitySlice {
+				sanitySlice[i] = sanityCheckValue
+			}
+		}
+	}
+
+}
+
+// sincResetX resets the internal state of the Sinc filter.
+func sincResetX(state *srcState) {
 	if state == nil || state.privateData == nil {
 		return
 	}

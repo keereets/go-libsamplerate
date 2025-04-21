@@ -10,6 +10,10 @@ import (
 
 // Converter is the interface representing an active sample rate converter instance.
 // Using an interface provides better encapsulation than exposing *srcState directly.
+// NOTE: Implementations of this interface are generally NOT goroutine-safe.
+// Do not call methods on the same Converter instance concurrently from multiple
+// goroutines without external synchronization. For concurrent processing, create
+// separate Converter instances per goroutine using New().
 type Converter interface {
 	// Process converts audio data according to the parameters in SrcData.
 	Process(data *SrcData) error
@@ -23,7 +27,7 @@ type Converter interface {
 	// It is important to call this when done, especially if C memory or
 	// OS resources were hypothetically involved (though less likely in pure Go).
 	Close() error
-	// Error returns the last error encountered by the converter.
+	// LastError Error returns the last error encountered by the converter.
 	// Note: Idiomatic Go prefers functions return errors directly. This mirrors the C API.
 	LastError() error
 	// Clone creates a new converter instance with the same internal state.
@@ -34,6 +38,7 @@ type Converter interface {
 var _ Converter = (*srcState)(nil)
 
 // New creates a new sample rate converter.
+// Each call returns a new independent instance. Instances are NOT goroutine-safe.
 func New(converterType ConverterType, channels int) (Converter, error) {
 	// Internal function psrcSetConverter handles the actual creation logic
 	state, errCode := psrcSetConverter(converterType, channels)
@@ -93,7 +98,150 @@ func CallbackNew(cbFunc CallbackFunc, converterType ConverterType, channels int,
 }
 
 // CallbackRead reads converted data when using callback mode.
+// *** VERSION WITH SAFE INPUT BUFFERING VIA COPY ***
 func CallbackRead(c Converter, ratio float64, framesToRead int64, outData []float32) (framesRead int64, err error) {
+	state, ok := c.(*srcState)
+	if !ok || state == nil {
+		return 0, mapError(ErrBadState)
+	}
+	if framesToRead <= 0 {
+		return 0, nil
+	}
+	if state.mode != ModeCallback {
+		return 0, mapError(ErrBadMode)
+	}
+	if state.callbackFunc == nil {
+		return 0, mapError(ErrNullCallback)
+	}
+	if isBadSrcRatio(ratio) {
+		return 0, mapError(ErrBadSrcRatio)
+	}
+	if len(outData) < int(framesToRead)*state.channels {
+		return 0, fmt.Errorf("output buffer too small: need %d, got %d", int(framesToRead)*state.channels, len(outData))
+	}
+
+	var srcData SrcData
+	srcData.SrcRatio = ratio
+	srcData.EndOfInput = false // Assume not EOF initially
+
+	totalOutputFramesGen := int64(0)
+	currentOutPos := 0
+	eofSignalledByCallback := false // Track EOF locally
+
+	// --- Manage internal buffer for leftover input ---
+	// Ensure state.savedData is initialized (e.g., in New or Reset)
+	// Let's assume it might be nil initially.
+
+	currentInputData := state.savedData // Start with saved data
+	currentInputFrames := state.savedFrames
+
+	for totalOutputFramesGen < framesToRead {
+
+		// --- Input Handling: Use saved data first, then call callback ---
+		if currentInputFrames == 0 && !eofSignalledByCallback {
+			// No saved data, and not EOF yet, call user callback
+			cbInputData, cbInputFrames, cbErr := state.callbackFunc(state.userCallbackData)
+			if cbErr != nil {
+				state.errCode = ErrBadCallback
+				return totalOutputFramesGen, fmt.Errorf("callback error: %w", cbErr)
+			}
+			if cbInputFrames == 0 || len(cbInputData) == 0 {
+				eofSignalledByCallback = true // Mark EOF
+				currentInputData = nil        // No more data
+				currentInputFrames = 0
+			} else {
+				currentInputData = cbInputData // Use fresh data from callback
+				currentInputFrames = cbInputFrames
+			}
+		}
+		// Set EndOfInput for Process call
+		srcData.EndOfInput = eofSignalledByCallback && (currentInputFrames == 0)
+
+		// --- Prepare SrcData for Process ---
+		srcData.DataIn = currentInputData
+		srcData.InputFrames = currentInputFrames
+
+		// Prepare output slice
+		remainingFramesOut := framesToRead - totalOutputFramesGen
+		outSliceLen := int(remainingFramesOut) * state.channels
+		if outSliceLen > len(outData[currentOutPos:]) {
+			outSliceLen = len(outData[currentOutPos:])
+		}
+		if outSliceLen <= 0 {
+			break
+		} // No more output space
+		srcData.DataOut = outData[currentOutPos : currentOutPos+outSliceLen]
+		srcData.OutputFrames = int64(outSliceLen / state.channels)
+		if srcData.OutputFrames <= 0 {
+			break
+		} // Break if calculated output frames is 0
+
+		srcData.InputFramesUsed = 0
+		srcData.OutputFramesGen = 0
+
+		// --- Call Process ---
+		processErr := c.Process(&srcData)
+		if processErr != nil {
+			state.errCode = mapGoErrorToCode(processErr)
+			return totalOutputFramesGen, processErr
+		}
+
+		// --- Update State based on Process results ---
+
+		// Calculate remaining *valid* input data from the buffer provided to Process
+		processedInputSamples := srcData.InputFramesUsed * int64(state.channels)
+		currentInputLenSamples := currentInputFrames * int64(state.channels) // Samples available at start of Process
+
+		if processedInputSamples > currentInputLenSamples {
+			// Process used more than available - internal error
+			state.errCode = ErrBadInternalState
+			return totalOutputFramesGen, mapError(ErrBadInternalState)
+		}
+
+		remainingInputSamples := currentInputLenSamples - processedInputSamples
+		remainingInputFrames := remainingInputSamples / int64(state.channels)
+
+		// ** SAFE BUFFERING: Copy remaining data **
+		if remainingInputSamples > 0 {
+			// Check if savedData buffer needs allocation or resizing
+			if state.savedData == nil || int64(cap(state.savedData)) < remainingInputSamples {
+				state.savedData = make([]float32, remainingInputSamples)
+			} else {
+				state.savedData = state.savedData[:remainingInputSamples] // Resize slice
+			}
+			// Copy the actual remaining data
+			copy(state.savedData, currentInputData[processedInputSamples:])
+			currentInputData = state.savedData // Point current to the saved buffer for next potential iteration
+		} else {
+			// No remaining data from this chunk
+			state.savedData = nil // Or state.savedData = state.savedData[:0] ? Nil seems cleaner.
+			currentInputData = nil
+		}
+		state.savedFrames = remainingInputFrames
+		currentInputFrames = remainingInputFrames // Update for next loop check
+		// ** END SAFE BUFFERING **
+
+		// Update output position
+		generatedOutputSamples := srcData.OutputFramesGen * int64(state.channels)
+		currentOutPos += int(generatedOutputSamples)
+		totalOutputFramesGen += srcData.OutputFramesGen
+
+		// Check termination conditions
+		if srcData.EndOfInput && srcData.OutputFramesGen == 0 {
+			break
+		}
+		if totalOutputFramesGen >= framesToRead {
+			break
+		}
+		// Stall check if needed...
+	}
+
+	state.errCode = ErrNoError
+	return totalOutputFramesGen, nil
+}
+
+// CallbackReadX reads converted data when using callback mode. Original version, with panic due to buffer corruption at state.savedData = srcData.DataIn
+func CallbackReadX(c Converter, ratio float64, framesToRead int64, outData []float32) (framesRead int64, err error) {
 	state, ok := c.(*srcState)
 	if !ok || state == nil {
 		return 0, mapError(ErrBadState)
@@ -283,6 +431,50 @@ func (state *srcState) Process(data *SrcData) error {
 
 // Reset resets the converter state via the VT.
 func (state *srcState) Reset() error {
+	// --- Check state on ENTRY ---
+	// Keep this check, but maybe make it non-fatal for now to see if vt.reset clears it
+	if state.lastPosition != 0.0 {
+		// Use Errorf for now instead of panic to see if vt.reset fixes it
+		//fmt.Printf("!!!! Reset ENTRY WARNING: non-zero state.lastPosition: %f !!!!\n", state.lastPosition)
+		// panic(fmt.Sprintf("Reset found non-zero state.lastPosition: %f", state.lastPosition))
+	}
+	if state.lastRatio != 0.0 {
+		//fmt.Printf("!!!! Reset ENTRY WARNING: non-zero state.lastRatio: %f !!!!\n", state.lastRatio)
+		// panic(fmt.Sprintf("Reset found non-zero state.lastRatio: %f", state.lastRatio))
+	}
+	// ... other initial checks (savedFrames, savedData) ...
+
+	if state == nil {
+		return mapError(ErrBadState)
+	}
+	if state.vt == nil || state.vt.reset == nil {
+		state.errCode = ErrBadProcPtr
+		return mapError(ErrBadProcPtr)
+	}
+
+	// Call the type-specific reset (e.g., sincReset, linearReset, zohReset)
+	state.vt.reset(state)
+
+	//// The type-specific reset should NOT modify these common fields.
+	//if state.lastPosition != 0.0 {
+	//	panic(fmt.Sprintf("Reset found non-zero state.lastPosition *after* vt.reset: %f", state.lastPosition))
+	//}
+	//if state.lastRatio != 0.0 {
+	//	panic(fmt.Sprintf("Reset found non-zero state.lastRatio *after* vt.reset: %f", state.lastRatio))
+	//}
+
+	// Reset common fields explicitly (this is the correct place)
+	state.lastPosition = 0.0
+	state.lastRatio = 0.0
+	state.savedData = nil
+	state.savedFrames = 0
+	state.errCode = ErrNoError
+
+	return nil
+}
+
+// ResetX resets the converter state via the VT.
+func (state *srcState) ResetX() error {
 	if state == nil {
 		return mapError(ErrBadState)
 	}

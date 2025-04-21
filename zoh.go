@@ -65,6 +65,21 @@ func newZohState(channels int) (*srcState, ErrorCode) {
 
 // zohReset resets the ZOH converter's private state.
 func zohReset(state *srcState) {
+	// ... (get filter, check ok) ...
+	filter, ok := state.privateData.(*zohFilter)
+	if !ok || filter == nil { /* handle error */
+		return
+	}
+
+	// Reset state (actual reset logic)
+	filter.dirty = false
+	for i := range filter.lastValue {
+		filter.lastValue[i] = 0.0
+	}
+}
+
+// zohResetX resets the ZOH converter's private state.
+func zohResetX(state *srcState) {
 	if state == nil || state.privateData == nil {
 		return
 	}
