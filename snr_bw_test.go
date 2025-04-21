@@ -25,7 +25,7 @@ const (
 	bufferLenSnr = 50000
 	maxFreqs     = 4
 	// maxRatios    = 6 // Not directly used in test data?
-	maxSpecLen      = 1 << 15 // 32768
+	maxSpecLen      = 1 << 18 // 32768
 	calcSnrMaxPeaks = 10      // Corresponds to MAX_PEAKS in C
 	calcSnrMinDb    = -200.0  // Floor for log magnitude
 )
