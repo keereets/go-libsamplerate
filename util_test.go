@@ -226,14 +226,14 @@ func Float64ToIntArray(in []float64, out []int32) {
 func TestIntToFloat(t *testing.T) {
 	input := make([]int32, bufferLen)
 	output := make([]int32, bufferLen)
-	// *** Use float64 for temp ***
+	// Use float64 for temp
 	temp := make([]float64, bufferLen)
 
 	for k := 0; k < len(input); k++ {
 		input[k] = int32((int64(k) * math.MinInt32) / int64(len(input)))
 	}
 
-	// *** Use float64 versions ***
+	// Use float64 versions
 	IntToFloat64Array(input, temp)
 	Float64ToIntArray(temp, output)
 

@@ -54,7 +54,6 @@ func newLinearState(channels int) (*srcState, ErrorCode) {
 	state.privateData = filter
 	state.vt = &linearStateVT
 
-	// ** Correction: Check error from Reset **
 	resetErr := state.Reset() // Calls linearReset via VT method
 	if resetErr != nil {
 		// If reset fails, the state is inconsistent.
@@ -265,10 +264,9 @@ func linearVariProcess(state *srcState, data *SrcData) ErrorCode {
 
 		// Figure out the next index.
 		inputIndex += 1.0 / srcRatio
-		// **Correction applied here:** Use := to declare intInputAdvance in this scope
-		intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex)) // <-- FIX: Use :=
-		inUsedSamples += int64(intInputAdvance) * int64(channels)     // Advance input usage marker (use int64 conversion)
-		inputIndex = fmodOne(inputIndex)                              // Keep fractional part
+		intInputAdvance := psfLrint(inputIndex - fmodOne(inputIndex))
+		inUsedSamples += int64(intInputAdvance) * int64(channels) // Advance input usage marker (use int64 conversion)
+		inputIndex = fmodOne(inputIndex)                          // Keep fractional part
 	}
 
 	// --- Final State Update ---
@@ -295,8 +293,8 @@ func linearVariProcess(state *srcState, data *SrcData) ErrorCode {
 
 	state.lastRatio = srcRatio
 
-	data.InputFramesUsed = inUsedSamples / int64(channels) // Use InputFramesUsed (corrected typo)
-	data.OutputFramesGen = outGenSamples / int64(channels) // Use OutputFramesGen (corrected typo)
+	data.InputFramesUsed = inUsedSamples / int64(channels)
+	data.OutputFramesGen = outGenSamples / int64(channels)
 
 	return ErrNoError
 }

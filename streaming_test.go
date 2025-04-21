@@ -99,7 +99,6 @@ func testStreaming(t *testing.T, converter ConverterType, srcRatio float64) {
 	var currentOutFrames int64 = 0
 	srcData := SrcData{SrcRatio: srcRatio}
 
-	// *** Increase maxLoops significantly ***
 	maxLoops := (totalInputLen / blockLenStreaming) + int(math.Ceil(expectedOutputF/float64(blockLenStreaming))) + 50 // Base on input+output blocks + generous margin
 	if maxLoops < 100 {
 		maxLoops = 100
@@ -239,14 +238,4 @@ func testStreaming(t *testing.T, converter ConverterType, srcRatio float64) {
 	if !t.Failed() {
 		t.Logf("%s ok", logPrefix)
 	}
-}
-
-// --- Assume these helpers exist elsewhere in the package ---
-
-// minInt64 returns the smaller of two int64 values.
-func minInt64(a, b int64) int64 {
-	if a < b {
-		return a
-	}
-	return b
 }

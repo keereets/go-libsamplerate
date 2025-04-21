@@ -27,14 +27,6 @@ func setupNextBlockLength() func(reset bool) int64 {
 	}
 }
 
-// absInt64 calculates the absolute value of an int64.
-func absInt64(x int64) int64 {
-	if x < 0 {
-		return -x
-	}
-	return x
-}
-
 // TestTerminationAPI corresponds to the main function driving the tests
 func TestTerminationAPI(t *testing.T) {
 	srcRatios := []float64{
@@ -174,10 +166,6 @@ func testTerminationInitTerm(t *testing.T, converter ConverterType, srcRatio flo
 	expectedOutputF := srcRatio * float64(inputLen)
 	terminateF := math.Ceil(math.Max(1.0, 1.0/srcRatio))
 
-	//vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-	//vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv CHANGE START vvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvvv
-	// *** ADJUST TOLERANCE for Output Check ***
-	// *** ADJUST TOLERANCE for Output Check (AGAIN) ***
 	var tolerance float64
 	// Add small extra margin (+1) to ceil(ratio) for high upsampling with Simple API
 	if srcRatio >= 1.0 {
@@ -185,8 +173,6 @@ func testTerminationInitTerm(t *testing.T, converter ConverterType, srcRatio flo
 	} else {
 		tolerance = terminateF // Keep C's tolerance (ceil(1/ratio)) for downsampling
 	}
-	//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^ CHANGE END ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-	//^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
 
 	diff := math.Abs(expectedOutputF - float64(srcData.OutputFramesGen))
 
@@ -367,12 +353,12 @@ func testTerminationStream(t *testing.T, converter ConverterType, srcRatio float
 		if currentInFrames > int64(totalInputLen)+terminate { /* ... t.Fatalf ... */
 		}
 
-		// *** RESTORED Internal Loop Check using targetOutputLen ***
 		if currentOutFrames > int64(targetOutputLen) {
 			t.Fatalf("%s currentOutFrames (%d) exceeds targetOutputLen (%d) mid-stream (C Line ~328)", logPrefix, currentOutFrames, targetOutputLen)
 		}
 
-		if !srcData.EndOfInput && srcData.InputFramesUsed == 0 && srcData.OutputFramesGen == 0 && srcData.InputFrames > 0 { /* ... t.Fatalf ... */
+		if !srcData.EndOfInput && srcData.InputFramesUsed == 0 && srcData.OutputFramesGen == 0 && srcData.InputFrames > 0 {
+			t.Fatalf("%s Process() stalled before EOF. Input provided=%d", logPrefix, srcData.InputFrames)
 		}
 
 	} // End streaming loop
