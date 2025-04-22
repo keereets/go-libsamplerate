@@ -1,8 +1,16 @@
 //go:build fftw_required
 
-//Needed for calculateSnrGo
+// Needed for calculateSnrGo
 
 // inspired by src-evaluate.c
+
+//
+// Copyright (c) 2025, Antonio Chirizzi <antonio.chirizzi@gmail.com>
+// All rights reserved.
+//
+// This code is released under 3-clause BSD license. Please see the
+// file LICENSE
+//
 
 package libsamplerate
 

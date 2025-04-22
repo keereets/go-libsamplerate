@@ -1,3 +1,11 @@
+//
+// Copyright (c) 2025, Antonio Chirizzi <antonio.chirizzi@gmail.com>
+// All rights reserved.
+//
+// This code is released under 3-clause BSD license. Please see the
+// file LICENSE
+//
+
 package libsamplerate
 
 import (
@@ -167,12 +175,3 @@ func appendFloatToBytesPCM16LE(dest []byte, src []float32, byteBuf []byte) []byt
 	}
 	return dest
 }
-
-// Note: You might need to add/ensure these exist in your package:
-// type ConverterType int
-// const ( SincBestQuality ConverterType = ... )
-// type Converter interface { ... }
-// type SrcData struct { ... }
-// func New(...) (Converter, error)
-// func Simple(...) error             // Not used here, but likely present
-// func FloatToShortArray(...)        // Not used here, replaced by custom logic

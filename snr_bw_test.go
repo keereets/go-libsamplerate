@@ -1,6 +1,5 @@
 //go:build fftw_required
 
-// snr_bw_test.go
 // ^^^ NOTE: This build tag ensures the test only compiles/runs if explicitly requested,
 //
 //	e.g., `go test -tags fftw_required`.
@@ -8,18 +7,27 @@
 //
 // run with: go test -tags fftw_required -run ^TestSnrBwAPI$ ./... -v
 // set SINC_DEBUG=1 as an env var to get debug from sinc.go
+
+//
+// Copyright (c) 2025, Antonio Chirizzi <antonio.chirizzi@gmail.com>
+// All rights reserved.
+//
+// This code is released under 3-clause BSD license. Please see the
+// file LICENSE
+//
+
 package libsamplerate
 
 import (
 	"fmt"
 	"math"
 	"math/cmplx"
-	"sort" // Needed for finding peaks
+	"sort"
 	"testing"
-	// --- FFT Dependency ---
+	// --- FFT Dependency for the test ---
+	"gonum.org/v1/gonum/dsp/fourier"
 )
 
-import "gonum.org/v1/gonum/dsp/fourier"
 
 const (
 	bufferLenSnr = 50000

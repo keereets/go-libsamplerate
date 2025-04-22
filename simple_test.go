@@ -1,4 +1,11 @@
-// samplerate_simple_test.go
+//
+// Copyright (c) 2025, Antonio Chirizzi <antonio.chirizzi@gmail.com>
+// All rights reserved.
+//
+// This code is released under 3-clause BSD license. Please see the
+// file LICENSE
+//
+
 package libsamplerate
 
 import (
@@ -198,10 +205,3 @@ func testSimpleOutputLength(t *testing.T, converterType ConverterType, srcRatio 
 	}
 }
 
-// You might need a minInt helper if not already present
-// func minInt(a, b int) int {
-// 	if a < b {
-// 		return a
-// 	}
-// 	return b
-// }

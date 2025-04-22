@@ -1,3 +1,11 @@
+//
+// Copyright (c) 2025, Antonio Chirizzi <antonio.chirizzi@gmail.com>
+// All rights reserved.
+//
+// This code is released under 3-clause BSD license. Please see the
+// file LICENSE
+//
+
 package libsamplerate
 
 import (
@@ -433,11 +441,6 @@ var sincMultichanStateVT = srcStateVT{
 	copy:         sincCopy,
 	close:        sincClose,
 }
-
-// --- TODO: Implement Processing & Helper Functions ---
-// sincMonoVariProcess, sincStereoVariProcess, etc.
-// calcOutputSingle, calcOutputStereo, etc.
-// prepareData
 
 // prepareData manages the internal buffer, loading new data as needed.
 // Corresponds to prepare_data in src_sinc.c

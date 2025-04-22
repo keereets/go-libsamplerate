@@ -3,7 +3,7 @@
 // All rights reserved.
 //
 // This code is released under 3-clause BSD license. Please see the
-// file COPYING
+// file LICENSE
 //
 
 package libsamplerate

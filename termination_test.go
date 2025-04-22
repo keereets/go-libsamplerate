@@ -1,11 +1,17 @@
-// termination_test.go
-package libsamplerate // Assuming tests are in the same package
+//
+// Copyright (c) 2025, Antonio Chirizzi <antonio.chirizzi@gmail.com>
+// All rights reserved.
+//
+// This code is released under 3-clause BSD license. Please see the
+// file LICENSE
+//
+
+package libsamplerate
 
 import (
 	"fmt"
 	"math"
 	"testing"
-	// Assumes types like ConverterType, SrcData, New, etc. are defined
 )
 
 const (
@@ -385,7 +391,3 @@ func testTerminationStream(t *testing.T, converter ConverterType, srcRatio float
 	}
 }
 
-// --- Assume these helpers exist elsewhere in the package ---
-// func minInt(a, b int) int { if a < b { return a }; return b }
-// func maxInt(a, b int) int { if a > b { return a }; return b }
-// func minInt64(a, b int64) int64 { if a < b { return a }; return b }

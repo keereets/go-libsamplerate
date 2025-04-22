@@ -1,4 +1,11 @@
-// zoh.go
+//
+// Copyright (c) 2025, Antonio Chirizzi <antonio.chirizzi@gmail.com>
+// All rights reserved.
+//
+// This code is released under 3-clause BSD license. Please see the
+// file LICENSE
+//
+
 package libsamplerate
 
 import (
@@ -53,7 +60,6 @@ func newZohState(channels int) (*srcState, ErrorCode) {
 	state.privateData = filter
 	state.vt = &zohStateVT
 
-	// ** Correction: Check error from Reset **
 	resetErr := state.Reset() // Calls zohReset via VT method
 	if resetErr != nil {
 		return nil, mapGoErrorToCode(resetErr)
