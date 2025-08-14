@@ -16,12 +16,13 @@ import (
 
 // --- Constants ---
 const (
-	mixInputSampleRate     = 24000.0
-	mixOutputSampleRate    = 8000.0
-	mixChannels            = 1   // Assuming Mono input/output
-	mixBytesPerInputFrame  = 2   // S16LE
-	mixBytesPerOutputFrame = 1   // u-Law
-	mixFactorDefault       = 0.6 // Default mix factor
+	mixInput24kHzSampleRate  = 24000.0
+	mixInput16kHzSampleRate  = 16000.0
+	mixOutputMuLawSampleRate = 8000.0
+	mixChannels              = 1   // Assuming Mono input/output
+	mixBytesPerInputFrame    = 2   // S16LE
+	mixBytesPerOutputFrame   = 1   // u-Law
+	mixFactorDefault         = 0.6 // Default mix factor
 )
 
 // --- Helper: S16LE Bytes to int16 ---
@@ -83,7 +84,7 @@ func linearToUlawGo(pcmVal int16) byte {
 	return ^uVal
 }
 
-// MixResampleUlaw mixes two S16LE 24kHz PCM audio streams, resamples to 8kHz,
+// MixResampleUlaw24to8 mixes two S16LE 24kHz PCM audio streams, resamples to 8kHz,
 // and converts to u-Law. It updates lastSample2MixedPos with the index of the
 // last sample used from pcmStream2 + 1 (wrapping if necessary).
 //
@@ -98,12 +99,60 @@ func linearToUlawGo(pcmVal int16) byte {
 // Returns:
 //
 //	A byte slice containing the resulting 8kHz u-Law audio data, or nil and an error.
-func MixResampleUlaw(
+func MixResampleUlaw24to8(
 	pcmStream1, pcmStream2 []byte,
 	lastSample2MixedPos *int, // Pointer to track position
 	mixFactor float32,
 ) ([]byte, error) {
+	return MixResampleUlawWithRatio(pcmStream1, pcmStream2, lastSample2MixedPos, mixOutputMuLawSampleRate/mixInput24kHzSampleRate, mixFactor)
+}
 
+// MixResampleUlaw16to8 mixes two S16LE 16kHz PCM audio streams, resamples to 8kHz,
+// and converts to u-Law. It updates lastSample2MixedPos with the index of the
+// last sample used from pcmStream2 + 1 (wrapping if necessary).
+//
+// Args:
+//
+//	pcmStream1: Byte slice containing the first S16LE 16kHz PCM stream.
+//	pcmStream2: Byte slice containing the second S16LE 16kHz PCM stream.
+//	lastSample2MixedPos: Pointer to an int storing the starting index (0-based) for reading pcmStream2.
+//	                     This value is updated on successful completion.
+//	mixFactor: The scaling factor applied to each stream before adding (0.0 to 1.0).
+//
+// Returns:
+//
+//	A byte slice containing the resulting 8kHz u-Law audio data, or nil and an error.
+func MixResampleUlaw16to8(
+	pcmStream1, pcmStream2 []byte,
+	lastSample2MixedPos *int, // Pointer to track position
+	mixFactor float32,
+) ([]byte, error) {
+	return MixResampleUlawWithRatio(pcmStream1, pcmStream2, lastSample2MixedPos, mixOutputMuLawSampleRate/mixInput16kHzSampleRate, mixFactor)
+}
+
+// MixResampleUlawWithRatio mixes two S16LE 24kHz PCM (or, for example 16kHz, depending on the srcRatio) PCM
+// audio streams, resamples to 8kHz, and converts to u-Law. It updates lastSample2MixedPos with the index of the
+// last sample used from pcmStream2 + 1 (wrapping if necessary).
+//
+// Args:
+//
+//		pcmStream1: Byte slice containing the first S16LE 24kHz PCM stream.
+//		pcmStream2: Byte slice containing the second S16LE 24kHz PCM stream.
+//		lastSample2MixedPos: Pointer to an int storing the starting index (0-based) for reading pcmStream2.
+//		                     This value is updated on successful completion.
+//	 srcRatio: the ratio of the stream to convert to the target stream. If it 24kHz to uLaw 8kHz, then it is 8/24 = 1/3.
+//	           if it's 16kHz to 8kHz, then it is 8/16 = 1/2.
+//		mixFactor: The scaling factor applied to each stream before adding (0.0 to 1.0).
+//
+// Returns:
+//
+//	A byte slice containing the resulting 8kHz u-Law audio data, or nil and an error.
+func MixResampleUlawWithRatio(
+	pcmStream1, pcmStream2 []byte,
+	lastSample2MixedPos *int, // Pointer to track position
+	srcRatio float64,
+	mixFactor float32,
+) ([]byte, error) {
 	// --- Input Validation ---
 	if len(pcmStream1)%mixBytesPerInputFrame != 0 {
 		return nil, fmt.Errorf("input stream 1 size (%d) not multiple of frame size (%d)", len(pcmStream1), mixBytesPerInputFrame)
@@ -120,12 +169,12 @@ func MixResampleUlaw(
 	totalInputFrames := frames1 // Process for the duration of stream 1
 
 	if totalInputFrames == 0 {
-		fmt.Println("MixResampleUlaw: Warning: Input stream 1 is empty. Returning empty output.")
+		fmt.Println("MixResampleUlaw24to8: Warning: Input stream 1 is empty. Returning empty output.")
 		// Do not update lastSample2MixedPos if no processing happens
 		return []byte{}, nil
 	}
 	if frames2 == 0 {
-		fmt.Println("MixResampleUlaw: Warning: Input stream 2 is empty. Mixing only stream 1.")
+		fmt.Println("MixResampleUlaw24to8: Warning: Input stream 2 is empty. Mixing only stream 1.")
 		// Allow proceeding, but stream 2 samples will be 0.0
 	}
 
@@ -133,16 +182,16 @@ func MixResampleUlaw(
 	startPos2 := *lastSample2MixedPos + 1
 	if frames2 > 0 { // Only wrap if stream 2 has frames
 		if startPos2 < 0 || startPos2 >= frames2 {
-			fmt.Printf("MixResampleUlaw: Info: Wrapping stream 2 index (%d -> 0), frames2=%d\n", startPos2, frames2)
+			fmt.Printf("MixResampleUlaw24to8: Info: Wrapping stream 2 index (%d -> 0), frames2=%d\n", startPos2, frames2)
 			startPos2 = 0
 		}
 	} else {
 		startPos2 = 0 // If stream 2 is empty, always start at 0 conceptually
 	}
-	// fmt.Printf("MixResampleUlaw: DEBUG: Mixing %d frames. Stream 2 starts at index %d (frames2=%d).\n", totalInputFrames, startPos2, frames2)
+	// fmt.Printf("MixResampleUlaw24to8: DEBUG: Mixing %d frames. Stream 2 starts at index %d (frames2=%d).\n", totalInputFrames, startPos2, frames2)
 
 	// --- libsamplerate Setup ---
-	const srcRatio = mixOutputSampleRate / mixInputSampleRate // 1.0 / 3.0
+	//const srcRatio = mixOutputMuLawSampleRate / mixInput24kHzSampleRate // 1.0 / 3.0
 	var state Converter
 	var err error
 
@@ -198,7 +247,7 @@ func MixResampleUlaw(
 	}
 	// Update the position pointer with the *next* index to be used from stream 2
 	*lastSample2MixedPos = i2
-	// fmt.Printf("MixResampleUlaw: DEBUG: Mixing complete. Next stream 2 index: %d\n", *lastSample2MixedPos)
+	// fmt.Printf("MixResampleUlaw24to8: DEBUG: Mixing complete. Next stream 2 index: %d\n", *lastSample2MixedPos)
 
 	// --- Resampling ---
 	srcData := SrcData{
@@ -216,7 +265,7 @@ func MixResampleUlaw(
 	}
 
 	framesGenerated := srcData.OutputFramesGen
-	// fmt.Printf("MixResampleUlaw: DEBUG: Resampling generated %d frames.\n", framesGenerated)
+	// fmt.Printf("MixResampleUlaw24to8: DEBUG: Resampling generated %d frames.\n", framesGenerated)
 
 	// --- Convert and Store Output (First Pass) ---
 	if framesGenerated > 0 {
@@ -224,7 +273,7 @@ func MixResampleUlaw(
 	}
 
 	// --- Flush Resampler ---
-	// fmt.Printf("MixResampleUlaw: DEBUG: Flushing resampler...\n")
+	// fmt.Printf("MixResampleUlaw24to8: DEBUG: Flushing resampler...\n")
 	srcData.DataIn = nil // No more input
 	srcData.InputFrames = 0
 	totalFlushedFrames := int64(0)
@@ -249,9 +298,9 @@ func MixResampleUlaw(
 		resultUlawVector = appendPCMFloatToUlawBytes(resultUlawVector, outputFloatBuffer[:framesGenerated*int64(mixChannels)])
 
 	}
-	// fmt.Printf("MixResampleUlaw: DEBUG: Flushing generated additional %d frames.\n", totalFlushedFrames)
+	// fmt.Printf("MixResampleUlaw24to8: DEBUG: Flushing generated additional %d frames.\n", totalFlushedFrames)
 
-	// fmt.Printf("MixResampleUlaw: DEBUG: Processing complete. Total output u-Law bytes: %d\n", len(resultUlawVector))
+	// fmt.Printf("MixResampleUlaw24to8: DEBUG: Processing complete. Total output u-Law bytes: %d\n", len(resultUlawVector))
 	return resultUlawVector, nil
 }
 
@@ -288,10 +337,18 @@ func appendPCMFloatToUlawBytes(dest []byte, src []float32) []byte {
 	return dest
 }
 
-// Optional wrapper with default mix factor
-func MixResampleUlawDefaultFactor(
+// MixResampleUlaw24to8DefaultFactor is an optional wrapper with default mix factor, but for 24kHz to 8kHz
+func MixResampleUlaw24to8DefaultFactor(
 	pcmStream1, pcmStream2 []byte,
 	lastSample2MixedPos *int,
 ) ([]byte, error) {
-	return MixResampleUlaw(pcmStream1, pcmStream2, lastSample2MixedPos, mixFactorDefault)
+	return MixResampleUlaw24to8(pcmStream1, pcmStream2, lastSample2MixedPos, mixFactorDefault)
+}
+
+// MixResampleUlaw16to8DefaultFactor is an optional wrapper with default mix factor, but for 16kHz to 8kHz
+func MixResampleUlaw16to8DefaultFactor(
+	pcmStream1, pcmStream2 []byte,
+	lastSample2MixedPos *int,
+) ([]byte, error) {
+	return MixResampleUlaw16to8(pcmStream1, pcmStream2, lastSample2MixedPos, mixFactorDefault)
 }
