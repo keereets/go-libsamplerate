@@ -337,6 +337,84 @@ func appendPCMFloatToUlawBytes(dest []byte, src []float32) []byte {
 	return dest
 }
 
+// appendPCMFloatToS16LEBytes converts float32 samples to S16LE bytes
+// and appends them to the destination slice.
+// Uses clamping and scaling by 32767 before encoding.
+func appendPCMFloatToS16LEBytes(dest []byte, src []float32) []byte {
+	// Pre-allocate a temporary 2-byte buffer to avoid allocation in the loop.
+	var buf [2]byte
+
+	// Grow destination slice once to avoid multiple reallocations.
+	if cap(dest)-len(dest) < len(src)*mixBytesPerInputFrame {
+		newDest := make([]byte, len(dest), len(dest)+len(src)*mixBytesPerInputFrame)
+		copy(newDest, dest)
+		dest = newDest
+	}
+
+	for _, sampleF := range src {
+		// Clamp float32 sample to [-1.0, 1.0]
+		clampedSample := sampleF
+		if clampedSample > 1.0 {
+			clampedSample = 1.0
+		} else if clampedSample < -1.0 {
+			clampedSample = -1.0
+		}
+
+		// Scale to int16 range using 32767 and cast
+		sampleS16 := int16(clampedSample * 32767.0)
+
+		// Convert int16 to little-endian bytes
+		binary.LittleEndian.PutUint16(buf[:], uint16(sampleS16))
+
+		// Append the bytes
+		dest = append(dest, buf[:]...)
+	}
+	return dest
+}
+
+// Resample24kHzTo16kHz resamples a S16LE 24kHz PCM audio stream to 16kHz S16LE PCM.
+//
+// Args:
+//
+//	pcmStream24kHz: Byte slice containing the S16LE 24kHz PCM stream.
+//
+// Returns:
+//
+//	A byte slice containing the resulting 16kHz S16LE PCM audio data, or nil and an error.
+func Resample24kHzTo16kHz(pcmStream24kHz []byte) ([]byte, error) {
+	// --- Input Validation ---
+	if len(pcmStream24kHz)%mixBytesPerInputFrame != 0 {
+		return nil, fmt.Errorf("input stream size (%d) not multiple of frame size (%d)", len(pcmStream24kHz), mixBytesPerInputFrame)
+	}
+
+	totalInputFrames := len(pcmStream24kHz) / mixBytesPerInputFrame
+	if totalInputFrames == 0 {
+		return []byte{}, nil // Return empty slice for empty input
+	}
+
+	// --- Convert input bytes to float32 buffer ---
+	inputFloatBuffer := make([]float32, totalInputFrames*mixChannels)
+	for i := 0; i < totalInputFrames; i++ {
+		byteIndex := i * mixBytesPerInputFrame
+		s16, err := bytesToS16LEGo(pcmStream24kHz, byteIndex)
+		if err != nil {
+			// This should be unreachable due to the length check above, but good practice.
+			return nil, fmt.Errorf("error reading input stream at index %d: %w", byteIndex, err)
+		}
+		inputFloatBuffer[i] = s16ToFloatGo(s16)
+	}
+
+	// --- libsamplerate Setup ---
+	const srcRatio = mixInput16kHzSampleRate / mixInput24kHzSampleRate // 16000.0 / 24000.0 = 2.0 / 3.0
+	state, err := New(SincBestQuality, mixChannels)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create resampler: %w", err)
+	}
+	defer state.Close()
+
+	return resampleStream(state, inputFloatBuffer, srcRatio)
+}
+
 // MixResampleUlaw24to8DefaultFactor is an optional wrapper with default mix factor, but for 24kHz to 8kHz
 func MixResampleUlaw24to8DefaultFactor(
 	pcmStream1, pcmStream2 []byte,
@@ -351,4 +429,59 @@ func MixResampleUlaw16to8DefaultFactor(
 	lastSample2MixedPos *int,
 ) ([]byte, error) {
 	return MixResampleUlaw16to8(pcmStream1, pcmStream2, lastSample2MixedPos, mixFactorDefault)
+}
+
+// resampleStream is a private helper to perform the core resampling and flushing logic.
+func resampleStream(state Converter, inputFloatBuffer []float32, srcRatio float64) ([]byte, error) {
+	totalInputFrames := len(inputFloatBuffer)
+
+	// --- Buffers ---
+	estimatedOutputFrames := int64(math.Ceil(float64(totalInputFrames)*srcRatio)) + 20
+	outputFloatBuffer := make([]float32, estimatedOutputFrames*int64(mixChannels))
+	// Estimate final byte slice capacity
+	resultBytes := make([]byte, 0, estimatedOutputFrames*int64(mixChannels)*mixBytesPerInputFrame)
+
+	// --- Resampling ---
+	srcData := SrcData{
+		DataIn:       inputFloatBuffer,
+		InputFrames:  int64(totalInputFrames),
+		DataOut:      outputFloatBuffer,
+		OutputFrames: int64(len(outputFloatBuffer)),
+		SrcRatio:     srcRatio,
+		EndOfInput:   true, // Process all input at once
+	}
+
+	if err := state.Process(&srcData); err != nil {
+		return nil, fmt.Errorf("resampling process failed: %w", err)
+	}
+
+	framesGenerated := srcData.OutputFramesGen
+
+	// --- Convert and Store Output (First Pass) ---
+	if framesGenerated > 0 {
+		resultBytes = appendPCMFloatToS16LEBytes(resultBytes, outputFloatBuffer[:framesGenerated*int64(mixChannels)])
+	}
+
+	// --- Flush Resampler ---
+	srcData.DataIn = nil // No more input
+	srcData.InputFrames = 0
+
+	for {
+		srcData.DataOut = outputFloatBuffer                  // Reuse buffer
+		srcData.OutputFrames = int64(len(outputFloatBuffer)) // Capacity
+		srcData.OutputFramesGen = 0                          // Reset before call
+
+		if err := state.Process(&srcData); err != nil {
+			return nil, fmt.Errorf("resampling flush failed: %w", err)
+		}
+
+		framesGenerated = srcData.OutputFramesGen
+		if framesGenerated <= 0 {
+			break // No more output from flush
+		}
+
+		resultBytes = appendPCMFloatToS16LEBytes(resultBytes, outputFloatBuffer[:framesGenerated*int64(mixChannels)])
+	}
+
+	return resultBytes, nil
 }

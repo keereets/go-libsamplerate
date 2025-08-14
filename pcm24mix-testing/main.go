@@ -13,6 +13,7 @@ func main() {
 	inputFile2_16 := "/home/antonio/go/src/syndeo-go-gen-ai/cpp/http-server/resources/last.input.twilio.PCM16.output.bin"
 	outputFile := "/tmp/mixed.golib-translated-24to8.8kHz.bin"
 	outputFile_16 := "/tmp/mixed.golib-translated-16to8.8kHz.bin"
+	outputFile1_converted := "/tmp/output_file_24kHz.converted.16kHz.raw"
 
 	file1, err := os.ReadFile(inputFile1)
 	if err != nil {
@@ -55,4 +56,18 @@ func main() {
 		log.Fatal(err)
 	}
 	log.Println("finished mixing and converting 2nd 16kHz file to uLaw", outputFile_16, inputFile1_16, inputFile2_16, "->", len(ulaw))
+
+	file1, err = os.ReadFile(inputFile1)
+	if err != nil {
+		log.Fatal(err)
+	}
+	if resampled16kHz, err := libsamplerate.Resample24kHzTo16kHz(file1); err != nil {
+		log.Fatal(err)
+	} else {
+		if err = os.WriteFile(outputFile1_converted, resampled16kHz, 0644); err != nil {
+			log.Fatal(err)
+		}
+		log.Println("finished converting 24kHz to 16kHz", inputFile1, "to", outputFile1_converted)
+	}
+
 }
