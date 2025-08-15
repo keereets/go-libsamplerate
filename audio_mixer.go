@@ -84,6 +84,31 @@ func linearToUlawGo(pcmVal int16) byte {
 	return ^uVal
 }
 
+// ulawToLinearGo converts a u-Law byte to a 16-bit linear PCM sample.
+// This is the inverse of linearToUlawGo, based on the G.711 standard.
+func ulawToLinearGo(ulawVal byte) int16 {
+	// This lookup table is part of the G.711 standard for u-law expansion.
+	// It represents the biased base of the exponent.
+	expLut := [8]int16{0, 132, 396, 924, 1980, 4092, 8316, 16764}
+
+	// Invert all bits as per the standard
+	ulawVal = ^ulawVal
+
+	// Extract sign (bit 7), exponent (bits 6-4), and mantissa (bits 3-0)
+	sign := (ulawVal & 0x80)
+	exponent := (ulawVal >> 4) & 0x07
+	mantissa := ulawVal & 0x0F
+
+	// Calculate the magnitude of the linear PCM value
+	pcmMag := expLut[exponent] + (int16(mantissa) << (uint(exponent) + 3))
+
+	// Apply the sign
+	if sign != 0 {
+		return -pcmMag
+	}
+	return pcmMag
+}
+
 // MixResampleUlaw24to8 mixes two S16LE 24kHz PCM audio streams, resamples to 8kHz,
 // and converts to u-Law. It updates lastSample2MixedPos with the index of the
 // last sample used from pcmStream2 + 1 (wrapping if necessary).
@@ -128,6 +153,73 @@ func MixResampleUlaw16to8(
 	mixFactor float32,
 ) ([]byte, error) {
 	return MixResampleUlawWithRatio(pcmStream1, pcmStream2, lastSample2MixedPos, mixOutputMuLawSampleRate/mixInput16kHzSampleRate, mixFactor)
+}
+
+// MixUlaw8kHz mixes two 8kHz mu-Law audio streams without resampling.
+// The output stream will have the length of the longer of the two input streams.
+//
+// Args:
+//
+//	stream1: Byte slice containing the first 8kHz mu-Law stream.
+//	stream2: Byte slice containing the second 8kHz mu-Law stream.
+//	mixFactor: The scaling factor applied to each stream before adding (0.0 to 1.0).
+//	           A value of 0.5 is recommended to prevent clipping.
+//
+// Returns:
+//
+//	A byte slice containing the resulting mixed 8kHz mu-Law audio data, or an error.
+func MixUlaw8kHz(stream1, stream2 []byte, mixFactor float32) ([]byte, error) {
+	if mixFactor < 0.0 || mixFactor > 1.0 {
+		return nil, fmt.Errorf("mixFactor must be between 0.0 and 1.0, got %f", mixFactor)
+	}
+
+	// Determine the length of the output stream
+	len1 := len(stream1)
+	len2 := len(stream2)
+	maxLen := len1
+	if len2 > maxLen {
+		maxLen = len2
+	}
+
+	if maxLen == 0 {
+		return []byte{}, nil
+	}
+
+	result := make([]byte, maxLen)
+
+	for i := 0; i < maxLen; i++ {
+		var pcm1, pcm2 int16
+
+		// Decode sample from stream 1, or use silence (0) if stream is shorter
+		if i < len1 {
+			pcm1 = ulawToLinearGo(stream1[i])
+		}
+
+		// Decode sample from stream 2, or use silence (0) if stream is shorter
+		if i < len2 {
+			pcm2 = ulawToLinearGo(stream2[i])
+		}
+
+		// Mix the samples as float32 to apply the factor accurately
+		mixedPcmFloat := float32(pcm1)*mixFactor + float32(pcm2)*mixFactor
+
+		// Clip the mixed sample to the int16 range to prevent overflow
+		if mixedPcmFloat > 32767.0 {
+			mixedPcmFloat = 32767.0
+		} else if mixedPcmFloat < -32768.0 {
+			mixedPcmFloat = -32768.0
+		}
+
+		// Convert back to int16 and encode the final sample back to mu-Law
+		result[i] = linearToUlawGo(int16(mixedPcmFloat))
+	}
+
+	return result, nil
+}
+
+// MixUlaw8kHzDefaultFactor is a wrapper for MixUlaw8kHz using the default mix factor.
+func MixUlaw8kHzDefaultFactor(stream1, stream2 []byte) ([]byte, error) {
+	return MixUlaw8kHz(stream1, stream2, mixFactorDefault)
 }
 
 // MixResampleUlawWithRatio mixes two S16LE 24kHz PCM (or, for example 16kHz, depending on the srcRatio) PCM
