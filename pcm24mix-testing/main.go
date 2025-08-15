@@ -82,7 +82,8 @@ func main() {
 		log.Fatal(err)
 	}
 
-	if mixed8kHz, err := libsamplerate.MixUlaw8kHzDefaultFactor(file1, file2); err != nil {
+	lastPos = 1000
+	if mixed8kHz, err := libsamplerate.MixUlaw8kHzDefaultFactor(file1, file2, &lastPos); err != nil {
 		log.Fatal(err)
 	} else {
 		if err = os.WriteFile(outputFile1_muLawMixed, mixed8kHz, 0644); err != nil {

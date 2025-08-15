@@ -156,48 +156,58 @@ func MixResampleUlaw16to8(
 }
 
 // MixUlaw8kHz mixes two 8kHz mu-Law audio streams without resampling.
-// The output stream will have the length of the longer of the two input streams.
+// The output stream will have the length of stream1. Stream2 is treated as a
+// looping background track, with its position maintained across calls.
 //
 // Args:
 //
-//	stream1: Byte slice containing the first 8kHz mu-Law stream.
-//	stream2: Byte slice containing the second 8kHz mu-Law stream.
+//	stream1: Byte slice containing the first 8kHz mu-Law stream. The length of this stream determines the output length.
+//	stream2: Byte slice containing the second 8kHz mu-Law stream to be mixed in.
+//	lastPosStream2: Pointer to an int storing the starting index for reading stream2.
+//	                This value is updated on successful completion.
 //	mixFactor: The scaling factor applied to each stream before adding (0.0 to 1.0).
 //	           A value of 0.5 is recommended to prevent clipping.
 //
 // Returns:
 //
 //	A byte slice containing the resulting mixed 8kHz mu-Law audio data, or an error.
-func MixUlaw8kHz(stream1, stream2 []byte, mixFactor float32) ([]byte, error) {
+func MixUlaw8kHz(stream1, stream2 []byte, lastPosStream2 *int, mixFactor float32) ([]byte, error) {
 	if mixFactor < 0.0 || mixFactor > 1.0 {
 		return nil, fmt.Errorf("mixFactor must be between 0.0 and 1.0, got %f", mixFactor)
 	}
+	if lastPosStream2 == nil {
+		return nil, fmt.Errorf("lastPosStream2 pointer must not be nil")
+	}
 
-	// Determine the length of the output stream
 	len1 := len(stream1)
 	len2 := len(stream2)
-	maxLen := len1
-	if len2 > maxLen {
-		maxLen = len2
+
+	if len1 == 0 {
+		return []byte{}, nil // Nothing to process
 	}
 
-	if maxLen == 0 {
-		return []byte{}, nil
+	// Validate and adjust starting position for stream 2
+	startPos2 := *lastPosStream2 + 1
+	if len2 > 0 { // Only wrap if stream 2 has frames
+		if startPos2 < 0 || startPos2 >= len2 {
+			startPos2 = 0 // Wrap around
+		}
+	} else {
+		startPos2 = 0 // If stream 2 is empty, always start at 0 conceptually
 	}
 
-	result := make([]byte, maxLen)
+	result := make([]byte, len1)
+	i2 := startPos2 // Current index for stream 2
 
-	for i := 0; i < maxLen; i++ {
+	for i1 := 0; i1 < len1; i1++ {
 		var pcm1, pcm2 int16
 
-		// Decode sample from stream 1, or use silence (0) if stream is shorter
-		if i < len1 {
-			pcm1 = ulawToLinearGo(stream1[i])
-		}
+		// Decode sample from stream 1
+		pcm1 = ulawToLinearGo(stream1[i1])
 
-		// Decode sample from stream 2, or use silence (0) if stream is shorter
-		if i < len2 {
-			pcm2 = ulawToLinearGo(stream2[i])
+		// Decode sample from stream 2, or use silence (0) if stream is empty
+		if len2 > 0 {
+			pcm2 = ulawToLinearGo(stream2[i2])
 		}
 
 		// Mix the samples as float32 to apply the factor accurately
@@ -211,15 +221,26 @@ func MixUlaw8kHz(stream1, stream2 []byte, mixFactor float32) ([]byte, error) {
 		}
 
 		// Convert back to int16 and encode the final sample back to mu-Law
-		result[i] = linearToUlawGo(int16(mixedPcmFloat))
+		result[i1] = linearToUlawGo(int16(mixedPcmFloat))
+
+		// Advance and wrap stream 2 index
+		if len2 > 0 {
+			i2++
+			if i2 >= len2 {
+				i2 = 0 // Wrap around
+			}
+		}
 	}
+
+	// Update the position pointer with the *next* index to be used from stream 2
+	*lastPosStream2 = i2
 
 	return result, nil
 }
 
 // MixUlaw8kHzDefaultFactor is a wrapper for MixUlaw8kHz using the default mix factor.
-func MixUlaw8kHzDefaultFactor(stream1, stream2 []byte) ([]byte, error) {
-	return MixUlaw8kHz(stream1, stream2, mixFactorDefault)
+func MixUlaw8kHzDefaultFactor(stream1, stream2 []byte, lastPosStream2 *int) ([]byte, error) {
+	return MixUlaw8kHz(stream1, stream2, lastPosStream2, mixFactorDefault)
 }
 
 // MixResampleUlawWithRatio mixes two S16LE 24kHz PCM (or, for example 16kHz, depending on the srcRatio) PCM
